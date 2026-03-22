@@ -615,9 +615,12 @@ def _extract_box_x(event):
 
 
 # ── Resolve processing methods from session state (widgets rendered in sections) ─
-clean_method   = st.session_state.get("clean_method",   CLEAN_METHODS[0])
-peak_method    = st.session_state.get("peak_method",    PEAK_METHODS[0])
-quality_method = st.session_state.get("quality_method", QUALITY_METHODS[0])
+clean_method    = st.session_state.get("clean_method",    CLEAN_METHODS[0])
+peak_method     = st.session_state.get("peak_method",     PEAK_METHODS[0])
+quality_methods = st.session_state.get("quality_methods", [QUALITY_METHODS[0]])
+if not quality_methods:
+    quality_methods = [QUALITY_METHODS[0]]
+quality_method = quality_methods[0]   # used for overview subplot + pipeline default
 
 # ── Resolve time window from session state (slider rendered later in col_main) ─
 # On first render session_state has no key → full range. Slider picks it up too.
@@ -684,12 +687,15 @@ def make_export_df() -> pd.DataFrame:
                               if "PPG_Rate" in signals_df.columns
                               else np.full(n, np.nan),
     })
-    if quality is not None:
-        q = np.array(quality)
-        mn = min(n, len(q))
-        df["signal_quality"] = np.concatenate([q[:mn], np.full(n - mn, np.nan)])
-    else:
-        df["signal_quality"] = np.nan
+    for _qm in quality_methods:
+        _qr = cached_pipeline(signal_bytes, sampling_rate, clean_method, peak_method, _qm)
+        _q  = _qr["quality"]
+        if _q is not None:
+            _qa = np.array(_q)
+            mn  = min(n, len(_qa))
+            df[f"quality_{_qm}"] = np.concatenate([_qa[:mn], np.full(n - mn, np.nan)])
+        else:
+            df[f"quality_{_qm}"] = np.nan
     return df
 
 def _dl_button(label: str, df: pd.DataFrame, filename: str, key: str):
@@ -979,44 +985,48 @@ st.divider()
 st.markdown('<div class="section-anchor" id="signal-quality"></div>', unsafe_allow_html=True)
 st.header("Signal Quality")
 
-st.selectbox("Quality Method", QUALITY_METHODS,
-             index=QUALITY_METHODS.index(quality_method), key="quality_method")
+st.segmented_control(
+    "Quality Methods", QUALITY_METHODS,
+    selection_mode="multi",
+    default=[QUALITY_METHODS[0]],
+    key="quality_methods",
+)
 
-if quality is not None:
-    q_arr = np.array(quality)
-    min_len = min(len(timestamps_w), len(q_arr))
-    st.caption("Box-select a region to zoom all charts")
-    ev_qual = st.plotly_chart(plot_quality(timestamps_w[:min_len], q_arr[:min_len], quality_method),
-                              width="stretch", key="chart_qual",
-                              on_select="rerun", selection_mode="box")
-    _b = _extract_box_x(ev_qual)
-    if _b:
-        st.session_state._pending_window = (max(_t0, min(_b)), min(_t1, max(_b)))
-        st.rerun()
-
-    mean_q = float(np.nanmean(q_arr))
-    c1, c2 = st.columns(2)
-    c1.metric("Mean Quality", f"{mean_q:.3f}")
-    _good_refs = _QUALITY_REFS.get(quality_method, [])
-    _good_thresh = next((v for v, _, lbl in _good_refs if "good" in lbl or "boundary" in lbl), None)
-    if _good_thresh is not None:
-        pct_good = float(np.mean(q_arr >= _good_thresh) * 100)
-        c2.metric(f"% Above {_good_thresh}", f"{pct_good:.1f}%")
-    elif quality_method == "skewness":
-        pct_good = float(np.mean(q_arr >= 0.0) * 100)
-        c2.metric("% Above 0 (good)", f"{pct_good:.1f}%")
+st.caption("Box-select a region on any chart to zoom all charts")
+for _qm in quality_methods:
+    _qres = cached_pipeline(signal_bytes, sampling_rate, clean_method, peak_method, _qm)
+    _q    = _qres["quality"]
+    _qerr = _qres["quality_error"]
+    if _q is not None:
+        _q_arr  = np.array(_q)
+        _minlen = min(len(timestamps_w), len(_q_arr))
+        ev_qual = st.plotly_chart(
+            plot_quality(timestamps_w[:_minlen], _q_arr[:_minlen], _qm),
+            width="stretch", key=f"chart_qual_{_qm}",
+            on_select="rerun", selection_mode="box",
+        )
+        _b = _extract_box_x(ev_qual)
+        if _b:
+            st.session_state._pending_window = (max(_t0, min(_b)), min(_t1, max(_b)))
+            st.rerun()
+        c1, c2 = st.columns(2)
+        c1.metric(f"{_qm} — Mean", f"{float(np.nanmean(_q_arr)):.3f}")
+        _good_refs  = _QUALITY_REFS.get(_qm, [])
+        _good_thresh = next((v for v, _, lbl in _good_refs if "good" in lbl or "boundary" in lbl), None)
+        if _good_thresh is not None:
+            c2.metric(f"% Above {_good_thresh}", f"{float(np.mean(_q_arr >= _good_thresh) * 100):.1f}%")
+        elif _qm == "skewness":
+            c2.metric("% Above 0 (good)", f"{float(np.mean(_q_arr >= 0.0) * 100):.1f}%")
+        else:
+            c2.metric("Std Dev", f"{float(np.nanstd(_q_arr)):.3f}")
     else:
-        c2.metric("Std Dev", f"{float(np.nanstd(q_arr)):.3f}")
-else:
-    if quality_error:
-        st.warning(f"Signal quality unavailable: `{quality_error}`")
-    else:
-        st.warning("Signal quality index not available for this signal/method combination.")
+        if _qerr:
+            st.warning(f"**{_qm}**: `{_qerr}`")
+        else:
+            st.warning(f"**{_qm}**: signal quality index not available.")
 
 _ex = make_export_df(); _c = signal_col.replace("-", "_")
-_dl_button("Export Signal Quality CSV",
-           _ex[["timestamp_ms", f"{_c}_raw", f"{_c}_cleaned", "signal_quality"]],
-           "signal_quality.csv", "dl_qual")
+_dl_button("Export Signal Quality CSV", _ex, "signal_quality.csv", "dl_qual")
 
 # ── Sidebar: all-in-one export (appended after pipeline runs) ─────────────────
 
