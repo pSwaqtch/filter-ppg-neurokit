@@ -1,3 +1,19 @@
+"""PPG Signal Filter & Analysis — Streamlit App
+
+Single-file R&D tool for filtering and analyzing PPG signals using NeuroKit2.
+
+Processing pipeline (in order):
+  1. Load CSV/XLSX → deduplication → sample rate detection
+  2. Signal transform: None | Invert (2^x − raw) | Flip AC (2×baseline − raw)
+  3. ppg_clean()  — Butterworth bandpass 0.5–8 Hz, zero-phase
+  4. ppg_peaks()  — systolic peak detection (Elgendi default)
+  5. ppg_rate()   — instantaneous HR from RR intervals
+  6. ppg_quality() — signal quality index (8 methods)
+  7. ppg_analyze() — HRV metrics (MeanNN, SDNN, RMSSD, …)
+
+For algorithm details and C porting reference, see ALGORITHM.md.
+Requires Python 3.10+  (neurokit2 ≥0.2.10 uses float | None, PEP 604).
+"""
 import matplotlib
 matplotlib.use("Agg")
 
@@ -89,7 +105,13 @@ def find_timestamp_col(df: pd.DataFrame) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def calculate_sample_rate(df: pd.DataFrame, timestamp_col: str = TIMESTAMP_COL) -> float:
-    """Calculate sample rate from deduplicated timestamps (ms)."""
+    """Calculate sample rate (Hz) from millisecond timestamps.
+
+    Primary:  SR = n_unique / (duration_ms / 1000)
+    Fallback: SR = 1000 / median(diff(timestamps))  — used if duration_ms == 0
+
+    C equivalent: see ALGORITHM.md §1.3
+    """
     ts = df[timestamp_col].dropna().values
     n_unique = len(np.unique(ts))
     duration_ms = ts.max() - ts.min()
@@ -108,7 +130,16 @@ def calculate_sample_rate(df: pd.DataFrame, timestamp_col: str = TIMESTAMP_COL) 
 
 @st.cache_data(show_spinner=False)
 def prepare_signal(df: pd.DataFrame, signal_col: str, timestamp_col: str = TIMESTAMP_COL):
-    """Return (timestamps_ms, signal_array, sample_rate) after cleaning."""
+    """Return (timestamps_ms, signal_array, sample_rate) after deduplication.
+
+    Steps:
+      1. Sort by timestamp (ascending)
+      2. Drop rows where signal_col is NaN
+      3. Drop duplicate timestamps — keep first occurrence  (handles hw clock jitter)
+      4. Compute sample rate from deduplicated timestamps
+
+    C equivalent: see ALGORITHM.md §1.2
+    """
     df = df.sort_values(timestamp_col)
     df = df.dropna(subset=[signal_col])
     df = df.drop_duplicates(subset=[timestamp_col], keep="first")
@@ -123,7 +154,42 @@ def prepare_signal(df: pd.DataFrame, signal_col: str, timestamp_col: str = TIMES
 # ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_data(show_spinner="Running NeuroKit2 pipeline…")
-def cached_pipeline(signal_bytes: bytes, sampling_rate: float, clean_method: str, peak_method: str, quality_method: str = "templatematch") -> dict:
+def cached_pipeline(
+    signal_bytes: bytes,
+    sampling_rate: float,
+    clean_method: str,
+    peak_method: str,
+    quality_method: str = "templatematch",
+) -> dict:
+    """Run the full NeuroKit2 PPG processing pipeline on a signal window.
+
+    Pipeline steps (C equivalent in ALGORITHM.md):
+      1. ppg_clean()    — bandpass filter (default: Butterworth 3rd-order 0.5–8 Hz,
+                          zero-phase via filtfilt).  See §3.
+      2. ppg_peaks()    — systolic peak detection (default: Elgendi dual-threshold
+                          on squared signal).  See §4.
+      3. ppg_rate()     — instantaneous HR from RR intervals, interpolated to
+                          signal length.  See §5.
+      4. ppg_quality()  — signal quality index; method-specific (see §8).
+                          Windowed methods auto-shrink window if signal < default window.
+      5. ppg_analyze()  — HRV metrics (MeanNN, SDNN, RMSSD, …).  See §7.
+                          Falls back to manual RR stats for short recordings.
+
+    Args:
+        signal_bytes:    float64 signal serialised with .tobytes() (for cache key).
+        sampling_rate:   Hz, float64.
+        clean_method:    one of CLEAN_METHODS.
+        peak_method:     one of PEAK_METHODS; "none" skips peak detection.
+        quality_method:  one of QUALITY_METHODS.
+
+    Returns dict with keys:
+        cleaned      np.ndarray[float64]  — bandpass-filtered signal
+        signals_df   pd.DataFrame         — PPG_Clean, PPG_Peaks, PPG_Rate columns
+        info         dict                 — {"PPG_Peaks": np.ndarray[int]}
+        quality      np.ndarray | None    — SQI values, same length as cleaned
+        quality_error str | None          — error message if quality failed
+        analysis     pd.DataFrame | None  — HRV metrics table
+    """
     signal = np.frombuffer(signal_bytes, dtype=np.float64)
 
     cleaned = nk.ppg_clean(signal, sampling_rate=sampling_rate, method=clean_method)
@@ -203,8 +269,24 @@ def cached_pipeline(signal_bytes: bytes, sampling_rate: float, clean_method: str
 
 
 @st.cache_data(show_spinner=False)
-def cached_epochs(signal_bytes: bytes, peak_indices_bytes: bytes, sampling_rate: float,
-                  epochs_start: float, epochs_end: float) -> dict:
+def cached_epochs(
+    signal_bytes: bytes,
+    peak_indices_bytes: bytes,
+    sampling_rate: float,
+    epochs_start: float,
+    epochs_end: float,
+) -> dict:
+    """Extract fixed-length windows around each peak.
+
+    For each peak index p_k, the extracted window is:
+        t ∈ [epochs_start, epochs_end]  seconds relative to peak
+        samples: p_k + int(epochs_start * SR)  ..  p_k + int(epochs_end * SR)
+
+    epochs_start is negative (pre-peak), epochs_end is positive (post-peak).
+    Peaks too close to signal boundaries are automatically dropped by NeuroKit2.
+
+    C equivalent: see ALGORITHM.md §6.
+    """
     signal = np.frombuffer(signal_bytes, dtype=np.float64)
     peak_indices = np.frombuffer(peak_indices_bytes, dtype=np.int64)
     return nk.epochs_create(signal, events=peak_indices, sampling_rate=sampling_rate,
@@ -212,7 +294,11 @@ def cached_epochs(signal_bytes: bytes, peak_indices_bytes: bytes, sampling_rate:
 
 
 def downsample(timestamps, signal, max_pts: int = 5_000):
-    """Stride-based downsample for display only — preserves shape."""
+    """Stride-based downsample for Plotly display only — preserves overall shape.
+
+    step = max(1, N // max_pts)
+    Returns every step-th sample.  Not used in any signal processing calculation.
+    """
     n = len(timestamps)
     if n <= max_pts:
         return timestamps, signal
@@ -387,7 +473,18 @@ def plot_peaks(timestamps_ms, cleaned, peak_indices) -> go.Figure:
 
 
 def plot_individual_beats(epochs: dict, hr_mean: float) -> go.Figure:
-    """Overlay individual beat waveforms + thick average, x-axis in seconds."""
+    """Overlay individual beat waveforms + thick average, x-axis in seconds.
+
+    Algorithm:
+      1. Find global [time_min, time_max] across all epochs.
+      2. Build common_t: 300-point linspace over that range.
+      3. For each beat: interpolate onto common_t within its actual time range;
+         set NaN outside the beat's range (avoids clipping artefact from np.interp).
+      4. Average: np.nanmean, masked to time points covered by ≥50% of beats.
+         This prevents truncated end-of-recording beats from pulling the average down.
+
+    C equivalent: see ALGORITHM.md §6 (interpolation + NaN-safe mean).
+    """
     # Collect all signals on a common time grid via interpolation
     time_min, time_max = np.inf, -np.inf
     for ep in epochs.values():
@@ -480,8 +577,12 @@ _QUALITY_COLORS = [
 
 
 def plot_quality(timestamps_ms, quality_map: dict) -> go.Figure:
-    """Plot one or more quality signals on a single figure.
-    quality_map: {method_name: quality_array}
+    """Plot one or more quality signals overlaid on a single figure.
+
+    quality_map: {method_name: np.ndarray}  — all arrays must match timestamps_ms length.
+
+    Reference lines per method are drawn from _QUALITY_REFS (deduplicated by value+colour).
+    See ALGORITHM.md §8 for threshold sources and method formulas.
     """
     fig = go.Figure()
     seen_refs: set = set()
