@@ -403,14 +403,20 @@ def plot_individual_beats(epochs: dict, hr_mean: float) -> go.Figure:
         s = ep["Signal"].values
         if len(t) < 2:
             continue
-        interp = np.interp(common_t, t, s)
-        beat_matrix.append(interp)
+        # Interpolate only within this beat's actual time range; NaN outside
+        row = np.full(len(common_t), np.nan)
+        in_range = (common_t >= t.min()) & (common_t <= t.max())
+        row[in_range] = np.interp(common_t[in_range], t, s)
+        beat_matrix.append(row)
 
     if not beat_matrix:
         return go.Figure()
 
     beat_matrix = np.array(beat_matrix)
-    avg = np.mean(beat_matrix, axis=0)
+    # Average only over time points covered by at least half the beats
+    coverage = np.sum(~np.isnan(beat_matrix), axis=0)
+    min_coverage = max(1, len(beat_matrix) // 2)
+    avg = np.where(coverage >= min_coverage, np.nanmean(beat_matrix, axis=0), np.nan)
 
     fig = go.Figure()
 
