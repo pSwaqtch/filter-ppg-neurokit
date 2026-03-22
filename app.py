@@ -295,7 +295,7 @@ def plot_signal_overview(timestamps_ms, signal, cleaned, peak_indices, quality, 
     return fig
 
 
-def plot_raw_signal(timestamps_ms, signal, signal_col: str, original=None) -> go.Figure:
+def plot_raw_signal(timestamps_ms, signal, signal_col: str, original=None, baseline=None) -> go.Figure:
     ts, sig = downsample(timestamps_ms, signal)
     fig = go.Figure()
     if original is not None:
@@ -310,6 +310,13 @@ def plot_raw_signal(timestamps_ms, signal, signal_col: str, original=None) -> go
         line=dict(color="#636EFA", width=1.5),
         name=f"{signal_col} (transformed)" if original is not None else signal_col,
     ))
+    if baseline is not None:
+        _, bl_d = downsample(timestamps_ms, baseline)
+        fig.add_trace(go.Scatter(
+            x=ts, y=bl_d, mode="lines",
+            line=dict(color="#FFA15A", width=1.2, dash="dot"),
+            name="sliding baseline",
+        ))
     fig.update_layout(
         template=DARK,
         title=f"Raw Signal — {signal_col}",
@@ -535,12 +542,16 @@ with st.sidebar:
                                    value=24, step=1,
                                    help="Inversion formula: 2^x − signal")
     if flip_ac:
-        flip_ac_window_s = st.number_input(
-            "Sliding window (s)",
-            min_value=0.1, max_value=30.0, value=2.0, step=0.1,
-            help="Width of the rolling mean used to estimate DC baseline. "
-                 "Smaller → follows DC drift closely; larger → flatter baseline.",
-        )
+        flip_ac_sliding = st.toggle("Sliding window mean", value=True,
+                                    help="ON: rolling mean baseline tracks DC drift.  "
+                                         "OFF: single global mean for the whole window.")
+        if flip_ac_sliding:
+            flip_ac_window_s = st.number_input(
+                "Sliding window (s)",
+                min_value=0.1, max_value=30.0, value=2.0, step=0.1,
+                help="Width of the rolling mean used to estimate DC baseline. "
+                     "Smaller → follows DC drift closely; larger → flatter baseline.",
+            )
 
     st.divider()
     st.subheader("Sample Rate")
@@ -598,17 +609,21 @@ mask = (timestamps_ms >= win_ms[0]) & (timestamps_ms <= win_ms[1])
 timestamps_w  = timestamps_ms[mask]
 signal_w_orig = signal[mask]
 signal_w      = signal_w_orig.copy()
+_flip_baseline = None
 if invert_signal:
     signal_w = float(2 ** adc_bits) - signal_w_orig
 elif flip_ac:
-    _win_samples = max(1, int(round(flip_ac_window_s * sampling_rate)))
-    _baseline = (
-        pd.Series(signal_w_orig)
-        .rolling(window=_win_samples, center=True, min_periods=1)
-        .mean()
-        .to_numpy()
-    )
-    signal_w = 2.0 * _baseline - signal_w_orig
+    if flip_ac_sliding:
+        _win_samples = max(1, int(round(flip_ac_window_s * sampling_rate)))
+        _flip_baseline = (
+            pd.Series(signal_w_orig)
+            .rolling(window=_win_samples, center=True, min_periods=1)
+            .mean()
+            .to_numpy()
+        )
+    else:
+        _flip_baseline = np.full(len(signal_w_orig), np.mean(signal_w_orig))
+    signal_w = 2.0 * _flip_baseline - signal_w_orig
 _signal_transformed = invert_signal or flip_ac
 
 # ── Run Pipeline ─────────────────────────────────────────────────────────────
@@ -791,7 +806,8 @@ col4.metric("SR", f"{sampling_rate:.1f} Hz")
 
 st.caption("Box-select a region to zoom all charts")
 ev_raw = st.plotly_chart(plot_raw_signal(timestamps_w, signal_w, signal_col,
-                                         original=signal_w_orig if _signal_transformed else None),
+                                         original=signal_w_orig if _signal_transformed else None,
+                                         baseline=_flip_baseline),
                          width="stretch", key="chart_raw",
                          on_select="rerun", selection_mode="box")
 _b = _extract_box_x(ev_raw)
