@@ -277,9 +277,9 @@ def plot_signal_overview(timestamps_ms, signal, cleaned, peak_indices, quality, 
         fig.add_trace(go.Scatter(x=ts_q, y=q_d, mode="lines",
             line=dict(color="#AB63FA", width=1.5), name="Quality",
             fill="tozeroy", fillcolor="rgba(171,99,250,0.15)"), row=4, col=1)
-        fig.add_hline(y=0.5, line_dash="dash", line_color="orange", row=4, col=1)
-        fig.add_hline(y=0.8, line_dash="dash", line_color="limegreen", row=4, col=1)
-        fig.update_yaxes(range=[0, 1], fixedrange=True, row=4, col=1)
+        for _v, _c, _lbl in _QUALITY_REFS.get(quality_method, []):
+            fig.add_hline(y=_v, line_dash="dash", line_color=_c, row=4, col=1)
+        fig.update_yaxes(autorange=True, fixedrange=True, row=4, col=1)
 
     # Y autorange on all signal rows so it always fits visible data
     for r in range(1, (3 if not has_q else 3) + 1):
@@ -473,26 +473,42 @@ _QUALITY_REFS = {
 }
 
 
-def plot_quality(timestamps_ms, quality, method="templatematch") -> go.Figure:
-    ts, q_d = downsample(timestamps_ms, quality)
+_QUALITY_COLORS = [
+    "#AB63FA", "#19D3F3", "#FFA15A", "#00CC96",
+    "#EF553B", "#636EFA", "#FF6692", "#B6E880",
+]
+
+
+def plot_quality(timestamps_ms, quality_map: dict) -> go.Figure:
+    """Plot one or more quality signals on a single figure.
+    quality_map: {method_name: quality_array}
+    """
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=ts, y=q_d, mode="lines",
-        line=dict(color="#AB63FA", width=1.5),
-        name="Quality",
-        fill="tozeroy",
-        fillcolor="rgba(171,99,250,0.15)",
-    ))
-    for val, color, label in _QUALITY_REFS.get(method, []):
-        fig.add_hline(y=val, line_dash="dash", line_color=color, annotation_text=label)
+    seen_refs: set = set()
+    for i, (method, quality) in enumerate(quality_map.items()):
+        color = _QUALITY_COLORS[i % len(_QUALITY_COLORS)]
+        ts, q_d = downsample(timestamps_ms, np.array(quality))
+        fig.add_trace(go.Scatter(
+            x=ts, y=q_d, mode="lines",
+            line=dict(color=color, width=1.5),
+            name=method,
+        ))
+        for val, ref_color, label in _QUALITY_REFS.get(method, []):
+            ref_key = (val, ref_color)
+            if ref_key not in seen_refs:
+                fig.add_hline(y=val, line_dash="dash", line_color=ref_color,
+                              annotation_text=label)
+                seen_refs.add(ref_key)
+    title = "Signal Quality — " + ", ".join(quality_map.keys())
     fig.update_layout(
         template=DARK,
-        title=f"Signal Quality — {method}",
+        title=title,
         xaxis_title="Timestamp (ms)",
         yaxis=dict(title="Quality", autorange=True),
         dragmode="select",
         height=350,
         margin=dict(l=40, r=20, t=40, b=40),
+        legend=dict(orientation="h", y=1.08, x=0),
     )
     return fig
 
@@ -992,38 +1008,51 @@ st.segmented_control(
     key="quality_methods",
 )
 
-st.caption("Box-select a region on any chart to zoom all charts")
+# Collect quality arrays for all selected methods
+_quality_map = {}
+_quality_errors = {}
 for _qm in quality_methods:
     _qres = cached_pipeline(signal_bytes, sampling_rate, clean_method, peak_method, _qm)
-    _q    = _qres["quality"]
-    _qerr = _qres["quality_error"]
-    if _q is not None:
-        _q_arr  = np.array(_q)
-        _minlen = min(len(timestamps_w), len(_q_arr))
-        ev_qual = st.plotly_chart(
-            plot_quality(timestamps_w[:_minlen], _q_arr[:_minlen], _qm),
-            width="stretch", key=f"chart_qual_{_qm}",
-            on_select="rerun", selection_mode="box",
-        )
-        _b = _extract_box_x(ev_qual)
-        if _b:
-            st.session_state._pending_window = (max(_t0, min(_b)), min(_t1, max(_b)))
-            st.rerun()
-        c1, c2 = st.columns(2)
-        c1.metric(f"{_qm} — Mean", f"{float(np.nanmean(_q_arr)):.3f}")
-        _good_refs  = _QUALITY_REFS.get(_qm, [])
+    if _qres["quality"] is not None:
+        _qa = np.array(_qres["quality"])
+        _minlen = min(len(timestamps_w), len(_qa))
+        _quality_map[_qm] = _qa[:_minlen]
+    elif _qres["quality_error"]:
+        _quality_errors[_qm] = _qres["quality_error"]
+    else:
+        _quality_errors[_qm] = "not available"
+
+if _quality_map:
+    # Align all arrays to the shortest length so x-axis matches
+    _common_len = min(len(v) for v in _quality_map.values())
+    _aligned_map = {m: v[:_common_len] for m, v in _quality_map.items()}
+    st.caption("Box-select a region to zoom all charts")
+    ev_qual = st.plotly_chart(
+        plot_quality(timestamps_w[:_common_len], _aligned_map),
+        width="stretch", key=f"chart_qual_{'_'.join(quality_methods)}",
+        on_select="rerun", selection_mode="box",
+    )
+    _b = _extract_box_x(ev_qual)
+    if _b:
+        st.session_state._pending_window = (max(_t0, min(_b)), min(_t1, max(_b)))
+        st.rerun()
+    # Metrics row — one column per method
+    _mcols = st.columns(max(1, len(_quality_map)))
+    for _col, (_qm, _qa) in zip(_mcols, _quality_map.items()):
+        _mean = float(np.nanmean(_qa))
+        _good_refs   = _QUALITY_REFS.get(_qm, [])
         _good_thresh = next((v for v, _, lbl in _good_refs if "good" in lbl or "boundary" in lbl), None)
         if _good_thresh is not None:
-            c2.metric(f"% Above {_good_thresh}", f"{float(np.mean(_q_arr >= _good_thresh) * 100):.1f}%")
+            _pct = float(np.mean(_qa >= _good_thresh) * 100)
+            _col.metric(f"{_qm}", f"{_mean:.3f}", f"{_pct:.0f}% above {_good_thresh}")
         elif _qm == "skewness":
-            c2.metric("% Above 0 (good)", f"{float(np.mean(_q_arr >= 0.0) * 100):.1f}%")
+            _pct = float(np.mean(_qa >= 0.0) * 100)
+            _col.metric(f"{_qm}", f"{_mean:.3f}", f"{_pct:.0f}% above 0")
         else:
-            c2.metric("Std Dev", f"{float(np.nanstd(_q_arr)):.3f}")
-    else:
-        if _qerr:
-            st.warning(f"**{_qm}**: `{_qerr}`")
-        else:
-            st.warning(f"**{_qm}**: signal quality index not available.")
+            _col.metric(f"{_qm}", f"{_mean:.3f}", f"σ={float(np.nanstd(_qa)):.3f}")
+
+for _qm, _err in _quality_errors.items():
+    st.warning(f"**{_qm}**: `{_err}`")
 
 _ex = make_export_df(); _c = signal_col.replace("-", "_")
 _dl_button("Export Signal Quality CSV", _ex, "signal_quality.csv", "dl_qual")
