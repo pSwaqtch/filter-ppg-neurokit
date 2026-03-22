@@ -446,9 +446,22 @@ def plot_individual_beats(epochs: dict, hr_mean: float) -> go.Figure:
     return fig
 
 
+# Per-method reference lines: (value, color, label)
+# Sources: Elgendi 2016 (skewness=0), clinical PI (0.3/1.0%), correlation convention (0.5/0.8)
+_QUALITY_REFS = {
+    "templatematch":  [(0.5, "orange", "0.5 acceptable"), (0.8, "limegreen", "0.8 good")],
+    "relative_power": [(0.5, "orange", "0.5 acceptable"), (0.8, "limegreen", "0.8 good")],
+    "ho2025":         [(0.5, "orange", "0/1 boundary")],
+    "skewness":       [(0.0, "orange", "0 threshold")],
+    "dissimilarity":  [],
+    "kurtosis":       [],
+    "entropy":        [],
+    "perfusion":      [(0.3, "orange", "0.3% acceptable"), (1.0, "limegreen", "1.0% good")],
+}
+
+
 def plot_quality(timestamps_ms, quality, method="templatematch") -> go.Figure:
     ts, q_d = downsample(timestamps_ms, quality)
-    bounded = method in ("templatematch", "relative_power", "ho2025")
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=ts, y=q_d, mode="lines",
@@ -457,9 +470,8 @@ def plot_quality(timestamps_ms, quality, method="templatematch") -> go.Figure:
         fill="tozeroy",
         fillcolor="rgba(171,99,250,0.15)",
     ))
-    if bounded:
-        fig.add_hline(y=0.5, line_dash="dash", line_color="orange", annotation_text="0.5")
-        fig.add_hline(y=0.8, line_dash="dash", line_color="limegreen", annotation_text="0.8")
+    for val, color, label in _QUALITY_REFS.get(method, []):
+        fig.add_hline(y=val, line_dash="dash", line_color=color, annotation_text=label)
     fig.update_layout(
         template=DARK,
         title=f"Signal Quality — {method}",
@@ -947,10 +959,18 @@ if quality is not None:
         st.rerun()
 
     mean_q = float(np.nanmean(q_arr))
-    pct_above_80 = float(np.mean(q_arr >= 0.8) * 100)
     c1, c2 = st.columns(2)
     c1.metric("Mean Quality", f"{mean_q:.3f}")
-    c2.metric("% Above 0.8", f"{pct_above_80:.1f}%")
+    _good_refs = _QUALITY_REFS.get(quality_method, [])
+    _good_thresh = next((v for v, _, lbl in _good_refs if "good" in lbl or "boundary" in lbl), None)
+    if _good_thresh is not None:
+        pct_good = float(np.mean(q_arr >= _good_thresh) * 100)
+        c2.metric(f"% Above {_good_thresh}", f"{pct_good:.1f}%")
+    elif quality_method == "skewness":
+        pct_good = float(np.mean(q_arr >= 0.0) * 100)
+        c2.metric("% Above 0 (good)", f"{pct_good:.1f}%")
+    else:
+        c2.metric("Std Dev", f"{float(np.nanstd(q_arr)):.3f}")
 else:
     if quality_error:
         st.warning(f"Signal quality unavailable: `{quality_error}`")
