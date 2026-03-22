@@ -9,7 +9,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Requires Python 3.9+.
+Requires **Python 3.10+** (neurokit2 ≥0.2.10 uses `float | None` union syntax from PEP 604).
 
 ## Data Format
 

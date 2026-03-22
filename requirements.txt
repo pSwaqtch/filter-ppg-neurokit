@@ -1,8 +1,10 @@
-streamlit>=1.35.0
-neurokit2>=0.2.9
-pandas>=2.0.0
-numpy>=1.26.0
-plotly>=5.22.0
-openpyxl>=3.1.2
-matplotlib>=3.8.0
-scipy>=1.13.0
+# Requires Python 3.10+
+# neurokit2 >=0.2.10 uses float | None union syntax (PEP 604) which is Python 3.10+ only
+streamlit>=1.45.0
+neurokit2>=0.2.12
+pandas>=2.2.0
+numpy>=2.0.0
+plotly>=6.0.0
+openpyxl>=3.1.5
+matplotlib>=3.9.0
+scipy>=1.14.0
