@@ -463,11 +463,30 @@ with st.sidebar:
 
     signal_col = st.selectbox("Channel", signal_cols)
 
+    # Reset timeline whenever file or channel changes
+    _source_key = (
+        chosen_file if data_source_mode == "Demo files" else getattr(uploaded, "name", ""),
+        signal_col,
+    )
+    if st.session_state.get("_source_key") != _source_key:
+        st.session_state.pop("analysis_window", None)
+        st.session_state.pop("_pending_window", None)
+        st.session_state["_source_key"] = _source_key
+
+    invert_signal = st.toggle("Invert Signal", value=False,
+                              help="Use when hardware outputs an inverted PPG (signal = 2^x − raw)")
+    if invert_signal:
+        adc_bits = st.number_input("ADC bits (x)", min_value=1, max_value=32,
+                                   value=24, step=1,
+                                   help="Inversion formula: 2^x − signal")
+
     st.divider()
     st.subheader("Sample Rate")
 
     # Prepare signal to get accurate SR from deduplicated data
     timestamps_ms, signal, detected_sr = prepare_signal(df_raw, signal_col, ts_col)
+    if invert_signal:
+        signal = float(2 ** adc_bits) - signal
 
     st.metric("Detected", f"{detected_sr:.1f} Hz")
     override_sr = st.toggle("Override SR")
