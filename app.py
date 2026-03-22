@@ -295,13 +295,20 @@ def plot_signal_overview(timestamps_ms, signal, cleaned, peak_indices, quality, 
     return fig
 
 
-def plot_raw_signal(timestamps_ms, signal, signal_col: str) -> go.Figure:
+def plot_raw_signal(timestamps_ms, signal, signal_col: str, original=None) -> go.Figure:
     ts, sig = downsample(timestamps_ms, signal)
     fig = go.Figure()
+    if original is not None:
+        _, orig_d = downsample(timestamps_ms, original)
+        fig.add_trace(go.Scatter(
+            x=ts, y=orig_d, mode="lines",
+            line=dict(color="rgba(160,160,160,0.35)", width=1),
+            name=f"{signal_col} (original)",
+        ))
     fig.add_trace(go.Scatter(
         x=ts, y=sig, mode="lines",
-        line=dict(color="#636EFA", width=1),
-        name=signal_col,
+        line=dict(color="#636EFA", width=1.5),
+        name=f"{signal_col} (transformed)" if original is not None else signal_col,
     ))
     fig.update_layout(
         template=DARK,
@@ -516,8 +523,13 @@ with st.sidebar:
         st.session_state.pop("_pending_window", None)
         st.session_state["_source_key"] = _source_key
 
-    invert_signal = st.toggle("Invert Signal", value=False,
-                              help="Use when hardware outputs an inverted PPG (signal = 2^x − raw)")
+    signal_transform = st.radio(
+        "Signal transform",
+        ["None", "Invert (2^x − raw)", "Flip AC (2×mean − signal)"],
+        help="None: use as-is  |  Invert: hardware ADC inversion  |  Flip AC: flip waveform polarity, preserve DC",
+    )
+    invert_signal = signal_transform == "Invert (2^x − raw)"
+    flip_ac       = signal_transform == "Flip AC (2×mean − signal)"
     if invert_signal:
         adc_bits = st.number_input("ADC bits (x)", min_value=1, max_value=32,
                                    value=24, step=1,
@@ -528,8 +540,6 @@ with st.sidebar:
 
     # Prepare signal to get accurate SR from deduplicated data
     timestamps_ms, signal, detected_sr = prepare_signal(df_raw, signal_col, ts_col)
-    if invert_signal:
-        signal = float(2 ** adc_bits) - signal
 
     st.metric("Detected", f"{detected_sr:.1f} Hz")
     override_sr = st.toggle("Override SR")
@@ -578,8 +588,14 @@ quality_method = st.session_state.get("quality_method", QUALITY_METHODS[0])
 win_ms = st.session_state.get("analysis_window", (_t0, _t1))
 
 mask = (timestamps_ms >= win_ms[0]) & (timestamps_ms <= win_ms[1])
-timestamps_w = timestamps_ms[mask]
-signal_w     = signal[mask]
+timestamps_w  = timestamps_ms[mask]
+signal_w_orig = signal[mask]
+signal_w      = signal_w_orig.copy()
+if invert_signal:
+    signal_w = float(2 ** adc_bits) - signal_w_orig
+elif flip_ac:
+    signal_w = 2.0 * np.mean(signal_w_orig) - signal_w_orig
+_signal_transformed = invert_signal or flip_ac
 
 # ── Run Pipeline ─────────────────────────────────────────────────────────────
 
@@ -742,10 +758,9 @@ with wc2:
 win_dur = (win_ms[1] - win_ms[0]) / 1000
 st.caption(f"{win_dur:.1f} s selected of {_duration_s:.1f} s total — box-select any chart below to zoom")
 
-# Apply window
+# Apply window (re-apply mask for slider; transforms already applied above)
 mask = (timestamps_ms >= win_ms[0]) & (timestamps_ms <= win_ms[1])
 timestamps_w = timestamps_ms[mask]
-signal_w     = signal[mask]
 
 st.divider()
 
@@ -761,7 +776,8 @@ col3.metric("Duration (window)", f"{(timestamps_w[-1] - timestamps_w[0]) / 1000:
 col4.metric("SR", f"{sampling_rate:.1f} Hz")
 
 st.caption("Box-select a region to zoom all charts")
-ev_raw = st.plotly_chart(plot_raw_signal(timestamps_w, signal_w, signal_col),
+ev_raw = st.plotly_chart(plot_raw_signal(timestamps_w, signal_w, signal_col,
+                                         original=signal_w_orig if _signal_transformed else None),
                          width="stretch", key="chart_raw",
                          on_select="rerun", selection_mode="box")
 _b = _extract_box_x(ev_raw)
@@ -872,6 +888,7 @@ else:
         st.plotly_chart(
             plot_individual_beats(epochs, hr_mean_beats),
             width="stretch",
+            key=f"chart_beats_{beat_pre}_{beat_post}",
         )
         st.caption(
             f"{len(epochs)} beats | window: −{beat_pre}s to +{beat_post}s around each peak"
