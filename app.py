@@ -534,6 +534,13 @@ with st.sidebar:
         adc_bits = st.number_input("ADC bits (x)", min_value=1, max_value=32,
                                    value=24, step=1,
                                    help="Inversion formula: 2^x − signal")
+    if flip_ac:
+        flip_ac_window_s = st.number_input(
+            "Sliding window (s)",
+            min_value=0.1, max_value=30.0, value=2.0, step=0.1,
+            help="Width of the rolling mean used to estimate DC baseline. "
+                 "Smaller → follows DC drift closely; larger → flatter baseline.",
+        )
 
     st.divider()
     st.subheader("Sample Rate")
@@ -594,7 +601,14 @@ signal_w      = signal_w_orig.copy()
 if invert_signal:
     signal_w = float(2 ** adc_bits) - signal_w_orig
 elif flip_ac:
-    signal_w = 2.0 * np.mean(signal_w_orig) - signal_w_orig
+    _win_samples = max(1, int(round(flip_ac_window_s * sampling_rate)))
+    _baseline = (
+        pd.Series(signal_w_orig)
+        .rolling(window=_win_samples, center=True, min_periods=1)
+        .mean()
+        .to_numpy()
+    )
+    signal_w = 2.0 * _baseline - signal_w_orig
 _signal_transformed = invert_signal or flip_ac
 
 # ── Run Pipeline ─────────────────────────────────────────────────────────────
