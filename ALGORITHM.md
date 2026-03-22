@@ -1,7 +1,31 @@
 # PPG Processing — Algorithm Reference for C Porting
 
-This document describes every signal processing step performed by `app.py` with explicit
-formulas, data types, and pseudocode. It is intended as a porting guide for a C implementation.
+This document describes every signal processing step with explicit formulas, data types,
+and pseudocode. It is intended as a porting guide for a C implementation.
+
+## Module Map
+
+| Python module | C mapping | Contents |
+|---|---|---|
+| `ppg_processing.py` | **Port this** | All signal algorithms — pure numpy, no UI |
+| `ppg_charts.py` | Leave in Python | Plotly chart builders, visualization only |
+| `app.py` | Leave in Python | Streamlit UI, session state, cache wrappers |
+
+The C port only needs to replicate `ppg_processing.py`. Key entry points:
+
+```c
+// Corresponds to ppg_processing.apply_signal_transform()
+void ppg_transform(double *signal, int N, transform_mode_t mode, ...);
+
+// Corresponds to ppg_processing.run_pipeline()
+ppg_result_t ppg_run_pipeline(double *signal, int N, double SR,
+                               clean_method_t clean, peak_method_t peaks,
+                               quality_method_t quality);
+
+// Corresponds to ppg_processing.extract_epochs()
+void ppg_extract_epochs(double *signal, int N, int *peak_idx, int P,
+                        double SR, double pre_s, double post_s, ...);
+```
 
 All floating-point values are **double (float64)** unless noted. Array indices are 0-based.
 

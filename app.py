@@ -1,17 +1,9 @@
-"""PPG Signal Filter & Analysis — Streamlit App
+"""app.py — Streamlit UI for PPG Signal Filter & Analysis.
 
-Single-file R&D tool for filtering and analyzing PPG signals using NeuroKit2.
+Thin UI layer: data loading, session state, @st.cache_data wrappers, and
+section rendering. All signal processing lives in ppg_processing.py;
+all chart builders live in ppg_charts.py.
 
-Processing pipeline (in order):
-  1. Load CSV/XLSX → deduplication → sample rate detection
-  2. Signal transform: None | Invert (2^x − raw) | Flip AC (2×baseline − raw)
-  3. ppg_clean()  — Butterworth bandpass 0.5–8 Hz, zero-phase
-  4. ppg_peaks()  — systolic peak detection (Elgendi default)
-  5. ppg_rate()   — instantaneous HR from RR intervals
-  6. ppg_quality() — signal quality index (8 methods)
-  7. ppg_analyze() — HRV metrics (MeanNN, SDNN, RMSSD, …)
-
-For algorithm details and C porting reference, see ALGORITHM.md.
 Requires Python 3.10+  (neurokit2 ≥0.2.10 uses float | None, PEP 604).
 """
 import matplotlib
@@ -20,15 +12,23 @@ matplotlib.use("Agg")
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import matplotlib.pyplot as plt
 import neurokit2 as nk
 import io
 import os
 
+from ppg_processing import (
+    CLEAN_METHODS, PEAK_METHODS, QUALITY_METHODS, TIMESTAMP_COL, QUALITY_REFS,
+    calculate_sample_rate, prepare_signal, apply_signal_transform,
+    run_pipeline, extract_epochs, auto_beat_windows, compute_hr_metrics,
+)
+from ppg_charts import (
+    plot_signal_overview, plot_raw_signal, plot_cleaned_overlay,
+    plot_peaks, plot_individual_beats, plot_quality,
+)
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Constants
+# App-level constants
 # ─────────────────────────────────────────────────────────────────────────────
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
@@ -40,24 +40,8 @@ DEMO_FILES = [
     "trial_data_5.xlsx",
 ]
 
-CLEAN_METHODS = [
-    "elgendi", "nabian2018", "pantompkins", "hamilton", "elgendi_old",
-    "langevin2021", "goda2024", "none",
-]
-PEAK_METHODS = [
-    "elgendi", "bishop", "ssf", "climbing", "derivative",
-    "kalidas2017", "nabian2018", "gamboa",
-    "charlton", "charlton2024", "none",
-]
-QUALITY_METHODS = [
-    "templatematch", "dissimilarity", "skewness",
-    "kurtosis", "entropy", "perfusion", "relative_power", "ho2025",
-]
-
-TIMESTAMP_COL = "timestamp"
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Data Loading
+# Data loading helpers (Streamlit IO — not portable to C)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_data(show_spinner="Loading file…")
@@ -82,8 +66,7 @@ def get_signal_columns(df: pd.DataFrame) -> list:
             continue
         if not pd.api.types.is_numeric_dtype(df[col]):
             continue
-        nan_frac = df[col].isna().mean()
-        if nan_frac < 0.8:
+        if df[col].isna().mean() < 0.8:
             cols.append(col)
     return cols
 
@@ -101,56 +84,7 @@ def find_timestamp_col(df: pd.DataFrame) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sample Rate
-# ─────────────────────────────────────────────────────────────────────────────
-
-def calculate_sample_rate(df: pd.DataFrame, timestamp_col: str = TIMESTAMP_COL) -> float:
-    """Calculate sample rate (Hz) from millisecond timestamps.
-
-    Primary:  SR = n_unique / (duration_ms / 1000)
-    Fallback: SR = 1000 / median(diff(timestamps))  — used if duration_ms == 0
-
-    C equivalent: see ALGORITHM.md §1.3
-    """
-    ts = df[timestamp_col].dropna().values
-    n_unique = len(np.unique(ts))
-    duration_ms = ts.max() - ts.min()
-    if duration_ms > 0:
-        return n_unique / (duration_ms / 1000.0)
-    # Fallback: use median inter-sample interval
-    diffs = np.diff(np.unique(ts))
-    if len(diffs) > 0 and np.median(diffs) > 0:
-        return 1000.0 / np.median(diffs)
-    return 100.0  # last-resort default
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Signal Preparation
-# ─────────────────────────────────────────────────────────────────────────────
-
-@st.cache_data(show_spinner=False)
-def prepare_signal(df: pd.DataFrame, signal_col: str, timestamp_col: str = TIMESTAMP_COL):
-    """Return (timestamps_ms, signal_array, sample_rate) after deduplication.
-
-    Steps:
-      1. Sort by timestamp (ascending)
-      2. Drop rows where signal_col is NaN
-      3. Drop duplicate timestamps — keep first occurrence  (handles hw clock jitter)
-      4. Compute sample rate from deduplicated timestamps
-
-    C equivalent: see ALGORITHM.md §1.2
-    """
-    df = df.sort_values(timestamp_col)
-    df = df.dropna(subset=[signal_col])
-    df = df.drop_duplicates(subset=[timestamp_col], keep="first")
-    sr = calculate_sample_rate(df, timestamp_col)
-    timestamps = df[timestamp_col].values
-    signal = df[signal_col].values.astype(float)
-    return timestamps, signal, sr
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# NeuroKit2 Pipeline (cached)
+# Cached wrappers (serialise numpy arrays for st.cache_data hash)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_data(show_spinner="Running NeuroKit2 pipeline…")
@@ -161,111 +95,9 @@ def cached_pipeline(
     peak_method: str,
     quality_method: str = "templatematch",
 ) -> dict:
-    """Run the full NeuroKit2 PPG processing pipeline on a signal window.
-
-    Pipeline steps (C equivalent in ALGORITHM.md):
-      1. ppg_clean()    — bandpass filter (default: Butterworth 3rd-order 0.5–8 Hz,
-                          zero-phase via filtfilt).  See §3.
-      2. ppg_peaks()    — systolic peak detection (default: Elgendi dual-threshold
-                          on squared signal).  See §4.
-      3. ppg_rate()     — instantaneous HR from RR intervals, interpolated to
-                          signal length.  See §5.
-      4. ppg_quality()  — signal quality index; method-specific (see §8).
-                          Windowed methods auto-shrink window if signal < default window.
-      5. ppg_analyze()  — HRV metrics (MeanNN, SDNN, RMSSD, …).  See §7.
-                          Falls back to manual RR stats for short recordings.
-
-    Args:
-        signal_bytes:    float64 signal serialised with .tobytes() (for cache key).
-        sampling_rate:   Hz, float64.
-        clean_method:    one of CLEAN_METHODS.
-        peak_method:     one of PEAK_METHODS; "none" skips peak detection.
-        quality_method:  one of QUALITY_METHODS.
-
-    Returns dict with keys:
-        cleaned      np.ndarray[float64]  — bandpass-filtered signal
-        signals_df   pd.DataFrame         — PPG_Clean, PPG_Peaks, PPG_Rate columns
-        info         dict                 — {"PPG_Peaks": np.ndarray[int]}
-        quality      np.ndarray | None    — SQI values, same length as cleaned
-        quality_error str | None          — error message if quality failed
-        analysis     pd.DataFrame | None  — HRV metrics table
-    """
+    """Cache wrapper around run_pipeline(). Signal passed as bytes for hashability."""
     signal = np.frombuffer(signal_bytes, dtype=np.float64)
-
-    cleaned = nk.ppg_clean(signal, sampling_rate=sampling_rate, method=clean_method)
-
-    if peak_method == "none":
-        signals_df = pd.DataFrame({"PPG_Clean": cleaned, "PPG_Peaks": 0})
-        info = {"PPG_Peaks": np.array([], dtype=int)}
-    else:
-        signals_df, info = nk.ppg_peaks(cleaned, sampling_rate=sampling_rate, method=peak_method)
-        # ppg_analyze requires PPG_Rate; ppg_peaks doesn't add it automatically
-        signals_df["PPG_Rate"] = nk.ppg_rate(
-            signals_df, sampling_rate=sampling_rate, desired_length=len(signals_df)
-        )
-
-    quality = None
-    quality_error = None
-    _peaks = info.get("PPG_Peaks", np.array([], dtype=int))
-    _needs_raw = quality_method in ("perfusion", "relative_power")
-    _signal_duration_s = len(cleaned) / sampling_rate
-
-    # Windowed methods need window_sec <= signal duration; auto-shrink to fit
-    _windowed = quality_method in ("skewness", "kurtosis", "entropy", "perfusion")
-    _default_win  = {"skewness": 3, "kurtosis": 3, "entropy": 3, "perfusion": 3, "relative_power": 60}
-    _default_ovlp = {"skewness": 2, "kurtosis": 2, "entropy": 2, "perfusion": 2, "relative_power": 30}
-    if quality_method in _default_win:
-        _win  = min(_default_win[quality_method],  max(1, _signal_duration_s * 0.9))
-        _ovlp = min(_default_ovlp[quality_method], _win * 0.5)
-    else:
-        _win = _ovlp = None
-
-    try:
-        quality = nk.ppg_quality(
-            cleaned,
-            peaks=_peaks if len(_peaks) > 0 else None,
-            sampling_rate=sampling_rate,
-            method=quality_method,
-            window_sec=_win,
-            overlap_sec=_ovlp,
-            ppg_raw=signal if _needs_raw else None,
-        )
-    except TypeError:
-        # Older NeuroKit2 (<0.2.10) — try without kwargs
-        try:
-            quality = nk.ppg_quality(cleaned, sampling_rate=sampling_rate)
-        except Exception as e:
-            quality_error = str(e)
-    except Exception as e:
-        quality_error = str(e)
-
-    analysis = None
-    try:
-        analysis = nk.ppg_analyze(signals_df, sampling_rate=sampling_rate,
-                                   method="interval-related")
-    except Exception:
-        # Full HRV analysis needs long recordings; compute basic RR stats instead
-        peak_idx = np.where(signals_df["PPG_Peaks"].values == 1)[0]
-        if len(peak_idx) >= 2:
-            rr_ms = np.diff(peak_idx) / sampling_rate * 1000
-            hr = 60000 / rr_ms
-            analysis = pd.DataFrame({
-                "PPG_Rate_Mean": [float(np.mean(hr))],
-                "PPG_Rate_SD":   [float(np.std(hr))],
-                "HRV_MeanNN":    [float(np.mean(rr_ms))],
-                "HRV_SDNN":      [float(np.std(rr_ms))],
-                "HRV_RMSSD":     [float(np.sqrt(np.mean(np.diff(rr_ms) ** 2)))],
-                "N_Peaks":       [int(len(peak_idx))],
-            })
-
-    return {
-        "cleaned": cleaned,
-        "signals_df": signals_df,
-        "info": info,
-        "quality": quality,
-        "quality_error": quality_error,
-        "analysis": analysis,
-    }
+    return run_pipeline(signal, sampling_rate, clean_method, peak_method, quality_method)
 
 
 @st.cache_data(show_spinner=False)
@@ -276,352 +108,77 @@ def cached_epochs(
     epochs_start: float,
     epochs_end: float,
 ) -> dict:
-    """Extract fixed-length windows around each peak.
-
-    For each peak index p_k, the extracted window is:
-        t ∈ [epochs_start, epochs_end]  seconds relative to peak
-        samples: p_k + int(epochs_start * SR)  ..  p_k + int(epochs_end * SR)
-
-    epochs_start is negative (pre-peak), epochs_end is positive (post-peak).
-    Peaks too close to signal boundaries are automatically dropped by NeuroKit2.
-
-    C equivalent: see ALGORITHM.md §6.
-    """
+    """Cache wrapper around extract_epochs(). Arrays passed as bytes for hashability."""
     signal = np.frombuffer(signal_bytes, dtype=np.float64)
     peak_indices = np.frombuffer(peak_indices_bytes, dtype=np.int64)
-    return nk.epochs_create(signal, events=peak_indices, sampling_rate=sampling_rate,
-                             epochs_start=epochs_start, epochs_end=epochs_end)
+    return extract_epochs(signal, peak_indices, sampling_rate, epochs_start, epochs_end)
 
 
-def downsample(timestamps, signal, max_pts: int = 5_000):
-    """Stride-based downsample for Plotly display only — preserves overall shape.
-
-    step = max(1, N // max_pts)
-    Returns every step-th sample.  Not used in any signal processing calculation.
-    """
-    n = len(timestamps)
-    if n <= max_pts:
-        return timestamps, signal
-    step = max(1, n // max_pts)
-    return timestamps[::step], signal[::step]
+@st.cache_data(show_spinner=False)
+def cached_prepare_signal(df: pd.DataFrame, signal_col: str, timestamp_col: str):
+    return prepare_signal(df, signal_col, timestamp_col)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Plotly Chart Builders
+# UI helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-DARK = "plotly_dark"
+def _extract_box_x(event):
+    """Extract x-range [lo, hi] from a Plotly box-selection event, or None."""
+    try:
+        if event and event.selection and event.selection.box:
+            box = event.selection.box[0]
+            if box.get("x"):
+                return float(box["x"][0]), float(box["x"][1])
+    except (AttributeError, IndexError, KeyError, TypeError):
+        pass
+    return None
 
 
-def plot_signal_overview(timestamps_ms, signal, cleaned, peak_indices, quality, signal_col) -> go.Figure:
-    """Combined subplot: raw / cleaned overlay / peaks / quality — shared X axis."""
-    has_q = quality is not None
-    n_rows = 4 if has_q else 3
-    row_heights = [0.28, 0.28, 0.28, 0.16] if has_q else [0.34, 0.33, 0.33]
-    subplot_titles = ["Raw Signal", "Processed Signal", "Peak Detection"]
-    if has_q:
-        subplot_titles.append("Signal Quality")
-
-    fig = make_subplots(
-        rows=n_rows, cols=1,
-        shared_xaxes=True,
-        subplot_titles=subplot_titles,
-        row_heights=row_heights,
-        vertical_spacing=0.05,
-    )
-
-    ts, sig_d = downsample(timestamps_ms, signal)
-    _, cln_d  = downsample(timestamps_ms, cleaned)
-
-    # Row 1 — Raw
-    fig.add_trace(go.Scatter(x=ts, y=sig_d, mode="lines",
-        line=dict(color="#636EFA", width=1), name=signal_col), row=1, col=1)
-
-    # Row 2 — Cleaned overlay
-    fig.add_trace(go.Scatter(x=ts, y=sig_d, mode="lines",
-        line=dict(color="rgba(160,160,160,0.35)", width=1),
-        name="Raw", legendgroup="overlay"), row=2, col=1)
-    fig.add_trace(go.Scatter(x=ts, y=cln_d, mode="lines",
-        line=dict(color="#00CC96", width=1.5),
-        name="Cleaned", legendgroup="overlay"), row=2, col=1)
-
-    # Row 3 — Peaks
-    fig.add_trace(go.Scatter(x=ts, y=cln_d, mode="lines",
-        line=dict(color="#00CC96", width=1.5),
-        name="Signal", showlegend=False), row=3, col=1)
-    if len(peak_indices) > 0:
-        fig.add_trace(go.Scatter(
-            x=timestamps_ms[peak_indices], y=cleaned[peak_indices], mode="markers",
-            marker=dict(color="#EF553B", size=7, symbol="triangle-up"),
-            name="Peaks"), row=3, col=1)
-
-    # Row 4 — Quality
-    if has_q:
-        q_arr = np.array(quality)
-        min_len = min(len(timestamps_ms), len(q_arr))
-        ts_q, q_d = downsample(timestamps_ms[:min_len], q_arr[:min_len])
-        fig.add_trace(go.Scatter(x=ts_q, y=q_d, mode="lines",
-            line=dict(color="#AB63FA", width=1.5), name="Quality",
-            fill="tozeroy", fillcolor="rgba(171,99,250,0.15)"), row=4, col=1)
-        for _v, _c, _lbl in _QUALITY_REFS.get(quality_method, []):
-            fig.add_hline(y=_v, line_dash="dash", line_color=_c, row=4, col=1)
-        fig.update_yaxes(autorange=True, fixedrange=True, row=4, col=1)
-
-    # Y autorange on all signal rows so it always fits visible data
-    for r in range(1, (3 if not has_q else 3) + 1):
-        fig.update_yaxes(autorange=True, row=r, col=1)
-
-    fig.update_xaxes(title_text="Timestamp (ms)", row=n_rows, col=1)
-    fig.update_layout(
-        template=DARK,
-        height=820 if has_q else 680,
-        legend=dict(orientation="h", y=1.02, x=0),
-        margin=dict(l=50, r=20, t=60, b=40),
-    )
-    return fig
+def _dl_button(label: str, df: pd.DataFrame, filename: str, key: str):
+    st.download_button(label, df.to_csv(index=False).encode(),
+                       filename, "text/csv", key=key, width="stretch")
 
 
-def plot_raw_signal(timestamps_ms, signal, signal_col: str, original=None, baseline=None) -> go.Figure:
-    ts, sig = downsample(timestamps_ms, signal)
-    fig = go.Figure()
-    if original is not None:
-        _, orig_d = downsample(timestamps_ms, original)
-        fig.add_trace(go.Scatter(
-            x=ts, y=orig_d, mode="lines",
-            line=dict(color="rgba(160,160,160,0.35)", width=1),
-            name=f"{signal_col} (original)",
-        ))
-    fig.add_trace(go.Scatter(
-        x=ts, y=sig, mode="lines",
-        line=dict(color="#636EFA", width=1.5),
-        name=f"{signal_col} (transformed)" if original is not None else signal_col,
-    ))
-    if baseline is not None:
-        _, bl_d = downsample(timestamps_ms, baseline)
-        fig.add_trace(go.Scatter(
-            x=ts, y=bl_d, mode="lines",
-            line=dict(color="#FFA15A", width=1.2, dash="dot"),
-            name="sliding baseline",
-        ))
-    fig.update_layout(
-        template=DARK,
-        title=f"Raw Signal — {signal_col}",
-        xaxis_title="Timestamp (ms)",
-        yaxis=dict(title="Amplitude", autorange=True),
-        dragmode="select",
-        height=350,
-        margin=dict(l=40, r=20, t=40, b=40),
-    )
-    return fig
-
-
-def plot_cleaned_overlay(timestamps_ms, raw, cleaned, signal_col: str) -> go.Figure:
-    ts, cln_d = downsample(timestamps_ms, cleaned)
-    fig = go.Figure()
-    if raw is not None:
-        _, raw_d = downsample(timestamps_ms, raw)
-        fig.add_trace(go.Scatter(
-            x=ts, y=raw_d, mode="lines",
-            line=dict(color="rgba(160,160,160,0.4)", width=1),
-            name="Raw",
-        ))
-    fig.add_trace(go.Scatter(
-        x=ts, y=cln_d, mode="lines",
-        line=dict(color="#00CC96", width=1.5),
-        name="Cleaned",
-    ))
-    fig.update_layout(
-        template=DARK,
-        title=f"Processed Signal — {signal_col}",
-        xaxis_title="Timestamp (ms)",
-        yaxis=dict(title="Amplitude", autorange=True),
-        dragmode="select",
-        height=350,
-        legend=dict(orientation="h", y=1.02),
-        margin=dict(l=40, r=20, t=50, b=40),
-    )
-    return fig
-
-
-def plot_peaks(timestamps_ms, cleaned, peak_indices) -> go.Figure:
-    ts, cln_d = downsample(timestamps_ms, cleaned)
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=ts, y=cln_d, mode="lines",
-        line=dict(color="#00CC96", width=1.5),
-        name="Cleaned",
-    ))
-    if len(peak_indices) > 0:
-        peak_ts = timestamps_ms[peak_indices]
-        peak_vals = cleaned[peak_indices]
-        fig.add_trace(go.Scatter(
-            x=peak_ts, y=peak_vals, mode="markers",
-            marker=dict(color="#EF553B", size=8, symbol="triangle-up"),
-            name="Peaks",
-        ))
-    fig.update_layout(
-        template=DARK,
-        title="Peak Detection",
-        xaxis_title="Timestamp (ms)",
-        yaxis=dict(title="Amplitude", autorange=True),
-        dragmode="select",
-        height=350,
-        legend=dict(orientation="h", y=1.02),
-        margin=dict(l=40, r=20, t=50, b=40),
-    )
-    return fig
-
-
-def plot_individual_beats(epochs: dict, hr_mean: float) -> go.Figure:
-    """Overlay individual beat waveforms + thick average, x-axis in seconds.
-
-    Algorithm:
-      1. Find global [time_min, time_max] across all epochs.
-      2. Build common_t: 300-point linspace over that range.
-      3. For each beat: interpolate onto common_t within its actual time range;
-         set NaN outside the beat's range (avoids clipping artefact from np.interp).
-      4. Average: np.nanmean, masked to time points covered by ≥50% of beats.
-         This prevents truncated end-of-recording beats from pulling the average down.
-
-    C equivalent: see ALGORITHM.md §6 (interpolation + NaN-safe mean).
-    """
-    # Collect all signals on a common time grid via interpolation
-    time_min, time_max = np.inf, -np.inf
-    for ep in epochs.values():
-        t = ep.index.astype(float)
-        time_min = min(time_min, t.min())
-        time_max = max(time_max, t.max())
-
-    common_t = np.linspace(time_min, time_max, 300)
-    beat_matrix = []
-
-    for ep in epochs.values():
-        t = ep.index.astype(float)
-        s = ep["Signal"].values
-        if len(t) < 2:
-            continue
-        # Interpolate only within this beat's actual time range; NaN outside
-        row = np.full(len(common_t), np.nan)
-        in_range = (common_t >= t.min()) & (common_t <= t.max())
-        row[in_range] = np.interp(common_t[in_range], t, s)
-        beat_matrix.append(row)
-
-    if not beat_matrix:
-        return go.Figure()
-
-    beat_matrix = np.array(beat_matrix)
-    # Average only over time points covered by at least half the beats
-    coverage = np.sum(~np.isnan(beat_matrix), axis=0)
-    min_coverage = max(1, len(beat_matrix) // 2)
-    avg = np.where(coverage >= min_coverage, np.nanmean(beat_matrix, axis=0), np.nan)
-
-    fig = go.Figure()
-
-    # Individual beats — thin grey, all sharing one legend entry
-    first = True
-    for beat in beat_matrix:
-        fig.add_trace(go.Scatter(
-            x=common_t, y=beat, mode="lines",
-            line=dict(color="rgba(180,180,180,0.25)", width=1),
-            name="Individual beats",
-            legendgroup="beats",
-            showlegend=first,
-        ))
-        first = False
-
-    # Average beat — thick red
-    fig.add_trace(go.Scatter(
-        x=common_t, y=avg, mode="lines",
-        line=dict(color="#C0392B", width=4),
-        name="Average beat shape",
-    ))
-
-    # Dashed vertical line at peak (t=0)
-    fig.add_vline(x=0, line_dash="dash", line_color="grey", line_width=1.5)
-
-    title = f"Individual beats ({len(beat_matrix)} beats"
-    if hr_mean is not None:
-        title += f", average heart rate: {hr_mean:.1f} bpm"
-    title += ")"
-
-    fig.update_layout(
-        template=DARK,
-        title=title,
-        xaxis_title="Time (seconds)",
-        yaxis_title="PPG",
-        height=420,
-        legend=dict(orientation="h", y=1.05),
-        margin=dict(l=50, r=20, t=60, b=50),
-    )
-    return fig
-
-
-# Per-method reference lines: (value, color, label)
-# Sources: Elgendi 2016 (skewness=0), clinical PI (0.3/1.0%), correlation convention (0.5/0.8)
-_QUALITY_REFS = {
-    "templatematch":  [(0.5, "orange", "0.5 acceptable"), (0.8, "limegreen", "0.8 good")],
-    "relative_power": [(0.5, "orange", "0.5 acceptable"), (0.8, "limegreen", "0.8 good")],
-    "ho2025":         [(0.5, "orange", "0/1 boundary")],
-    "skewness":       [(0.0, "orange", "0 threshold")],
-    "dissimilarity":  [],
-    "kurtosis":       [],
-    "entropy":        [],
-    "perfusion":      [(0.3, "orange", "0.3% acceptable"), (1.0, "limegreen", "1.0% good")],
-}
-
-
-_QUALITY_COLORS = [
-    "#AB63FA", "#19D3F3", "#FFA15A", "#00CC96",
-    "#EF553B", "#636EFA", "#FF6692", "#B6E880",
-]
-
-
-def plot_quality(timestamps_ms, quality_map: dict) -> go.Figure:
-    """Plot one or more quality signals overlaid on a single figure.
-
-    quality_map: {method_name: np.ndarray}  — all arrays must match timestamps_ms length.
-
-    Reference lines per method are drawn from _QUALITY_REFS (deduplicated by value+colour).
-    See ALGORITHM.md §8 for threshold sources and method formulas.
-    """
-    fig = go.Figure()
-    seen_refs: set = set()
-    for i, (method, quality) in enumerate(quality_map.items()):
-        color = _QUALITY_COLORS[i % len(_QUALITY_COLORS)]
-        ts, q_d = downsample(timestamps_ms, np.array(quality))
-        fig.add_trace(go.Scatter(
-            x=ts, y=q_d, mode="lines",
-            line=dict(color=color, width=1.5),
-            name=method,
-        ))
-        for val, ref_color, label in _QUALITY_REFS.get(method, []):
-            ref_key = (val, ref_color)
-            if ref_key not in seen_refs:
-                fig.add_hline(y=val, line_dash="dash", line_color=ref_color,
-                              annotation_text=label)
-                seen_refs.add(ref_key)
-    title = "Signal Quality — " + ", ".join(quality_map.keys())
-    fig.update_layout(
-        template=DARK,
-        title=title,
-        xaxis_title="Timestamp (ms)",
-        yaxis=dict(title="Quality", autorange=True),
-        dragmode="select",
-        height=350,
-        margin=dict(l=40, r=20, t=40, b=40),
-        legend=dict(orientation="h", y=1.08, x=0),
-    )
-    return fig
+def make_export_df(
+    timestamps_w, signal_w, cleaned, signals_df,
+    signal_col, signal_bytes, sampling_rate,
+    clean_method, peak_method, quality_methods,
+) -> pd.DataFrame:
+    """Build the master export DataFrame for the current window."""
+    n   = len(timestamps_w)
+    col = signal_col.replace("-", "_")
+    df  = pd.DataFrame({
+        "timestamp_ms":   timestamps_w,
+        f"{col}_raw":     signal_w,
+        f"{col}_cleaned": cleaned,
+        "PPG_Peak":       signals_df["PPG_Peaks"].values.astype(int),
+        "PPG_Rate_bpm":   signals_df["PPG_Rate"].values
+                          if "PPG_Rate" in signals_df.columns
+                          else np.full(n, np.nan),
+    })
+    for _qm in quality_methods:
+        _qr = cached_pipeline(signal_bytes, sampling_rate, clean_method, peak_method, _qm)
+        _q  = _qr["quality"]
+        if _q is not None:
+            _qa = np.array(_q)
+            mn  = min(n, len(_qa))
+            df[f"quality_{_qm}"] = np.concatenate([_qa[:mn], np.full(n - mn, np.nan)])
+        else:
+            df[f"quality_{_qm}"] = np.nan
+    return df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Streamlit App
+# Page config
 # ─────────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="PPG Filter & Analysis", layout="wide")
 st.title("PPG Signal Filter & Analysis")
 
-# ── Sidebar ──────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Sidebar
+# ─────────────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
     st.header("Data Source")
@@ -644,10 +201,8 @@ with st.sidebar:
             st.info("Upload a file to continue.")
             st.stop()
 
-    # Timestamp column detection
     ts_col = find_timestamp_col(df_raw)
 
-    # Channel selection
     signal_cols = get_signal_columns(df_raw)
     if not signal_cols:
         st.warning("No valid signal columns found (all numeric non-timestamp columns are >80% NaN).")
@@ -665,6 +220,7 @@ with st.sidebar:
         st.session_state.pop("_pending_window", None)
         st.session_state["_source_key"] = _source_key
 
+    # ── Signal Transform ──────────────────────────────────────────────────────
     signal_transform = st.radio(
         "Signal transform",
         ["None", "Invert (2^x − raw)", "Flip AC (2×mean − signal)"],
@@ -672,6 +228,11 @@ with st.sidebar:
     )
     invert_signal = signal_transform == "Invert (2^x − raw)"
     flip_ac       = signal_transform == "Flip AC (2×mean − signal)"
+
+    adc_bits = 24
+    flip_ac_sliding  = True
+    flip_ac_window_s = 2.0
+
     if invert_signal:
         adc_bits = st.number_input("ADC bits (x)", min_value=1, max_value=32,
                                    value=24, step=1,
@@ -684,15 +245,13 @@ with st.sidebar:
             flip_ac_window_s = st.number_input(
                 "Sliding window (s)",
                 min_value=0.1, max_value=30.0, value=2.0, step=0.1,
-                help="Width of the rolling mean used to estimate DC baseline. "
-                     "Smaller → follows DC drift closely; larger → flatter baseline.",
+                help="Width of the rolling mean used to estimate DC baseline.",
             )
 
     st.divider()
     st.subheader("Sample Rate")
 
-    # Prepare signal to get accurate SR from deduplicated data
-    timestamps_ms, signal, detected_sr = prepare_signal(df_raw, signal_col, ts_col)
+    timestamps_ms, signal, detected_sr = cached_prepare_signal(df_raw, signal_col, ts_col)
 
     st.metric("Detected", f"{detected_sr:.1f} Hz")
     override_sr = st.toggle("Override SR")
@@ -713,58 +272,40 @@ with st.sidebar:
     st.divider()
     show_nk_plot = st.checkbox("Show NeuroKit2 native plot (matplotlib)")
 
-    # Apply any window queued by a chart box-selection before the slider renders
     if "_pending_window" in st.session_state:
         st.session_state.analysis_window = st.session_state.pop("_pending_window")
 
 
-# ── Helper: extract x-range from a Plotly box-selection event ─────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Resolve session state before pipeline
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _extract_box_x(event):
-    try:
-        if event and event.selection and event.selection.box:
-            box = event.selection.box[0]
-            if box.get("x"):
-                return float(box["x"][0]), float(box["x"][1])
-    except (AttributeError, IndexError, KeyError, TypeError):
-        pass
-    return None
-
-
-# ── Resolve processing methods from session state (widgets rendered in sections) ─
 clean_method    = st.session_state.get("clean_method",    CLEAN_METHODS[0])
 peak_method     = st.session_state.get("peak_method",     PEAK_METHODS[0])
 quality_methods = st.session_state.get("quality_methods", [QUALITY_METHODS[0]])
 if not quality_methods:
     quality_methods = [QUALITY_METHODS[0]]
-quality_method = quality_methods[0]   # used for overview subplot + pipeline default
+quality_method = quality_methods[0]   # used for overview subplot
 
-# ── Resolve time window from session state (slider rendered later in col_main) ─
-# On first render session_state has no key → full range. Slider picks it up too.
 win_ms = st.session_state.get("analysis_window", (_t0, _t1))
 
+# ── Apply window mask + signal transform ──────────────────────────────────────
 mask = (timestamps_ms >= win_ms[0]) & (timestamps_ms <= win_ms[1])
 timestamps_w  = timestamps_ms[mask]
 signal_w_orig = signal[mask]
-signal_w      = signal_w_orig.copy()
-_flip_baseline = None
-if invert_signal:
-    signal_w = float(2 ** adc_bits) - signal_w_orig
-elif flip_ac:
-    if flip_ac_sliding:
-        _win_samples = max(1, int(round(flip_ac_window_s * sampling_rate)))
-        _flip_baseline = (
-            pd.Series(signal_w_orig)
-            .rolling(window=_win_samples, center=True, min_periods=1)
-            .mean()
-            .to_numpy()
-        )
-    else:
-        _flip_baseline = np.full(len(signal_w_orig), np.mean(signal_w_orig))
-    signal_w = 2.0 * _flip_baseline - signal_w_orig
-_signal_transformed = invert_signal or flip_ac
 
-# ── Run Pipeline ─────────────────────────────────────────────────────────────
+transform_mode = "invert" if invert_signal else ("flip_ac" if flip_ac else "none")
+signal_w, _flip_baseline = apply_signal_transform(
+    signal_w_orig,
+    mode=transform_mode,
+    adc_bits=adc_bits,
+    flip_sliding=flip_ac_sliding,
+    flip_window_s=flip_ac_window_s,
+    sampling_rate=sampling_rate,
+)
+_signal_transformed = transform_mode != "none"
+
+# ── Run Pipeline ──────────────────────────────────────────────────────────────
 
 if len(signal_w) < 10:
     st.error("Selected window is too short. Widen the time window in the sidebar.")
@@ -781,118 +322,55 @@ except Exception as e:
     st.error(f"Unexpected error during pipeline: {e}")
     st.stop()
 
-cleaned = results["cleaned"]
+cleaned    = results["cleaned"]
 signals_df = results["signals_df"]
-info = results["info"]
-quality       = results["quality"]
-quality_error = results["quality_error"]
-analysis = results["analysis"]
+info       = results["info"]
+quality    = results["quality"]
+analysis   = results["analysis"]
 
 peak_indices = info.get("PPG_Peaks", np.array([], dtype=int))
 
-# ── Master export DataFrame ───────────────────────────────────────────────────
-
-def make_export_df() -> pd.DataFrame:
-    n = len(timestamps_w)
-    col = signal_col.replace("-", "_")
-    df = pd.DataFrame({
-        "timestamp_ms":       timestamps_w,
-        f"{col}_raw":         signal_w,
-        f"{col}_cleaned":     cleaned,
-        "PPG_Peak":           signals_df["PPG_Peaks"].values.astype(int),
-        "PPG_Rate_bpm":       signals_df["PPG_Rate"].values
-                              if "PPG_Rate" in signals_df.columns
-                              else np.full(n, np.nan),
-    })
-    for _qm in quality_methods:
-        _qr = cached_pipeline(signal_bytes, sampling_rate, clean_method, peak_method, _qm)
-        _q  = _qr["quality"]
-        if _q is not None:
-            _qa = np.array(_q)
-            mn  = min(n, len(_qa))
-            df[f"quality_{_qm}"] = np.concatenate([_qa[:mn], np.full(n - mn, np.nan)])
-        else:
-            df[f"quality_{_qm}"] = np.nan
-    return df
-
-def _dl_button(label: str, df: pd.DataFrame, filename: str, key: str):
-    st.download_button(label, df.to_csv(index=False).encode(),
-                       filename, "text/csv", key=key, width="stretch")
-
-# ── Auto beat windows ─────────────────────────────────────────────────────────
-
-def auto_beat_windows(peak_indices, sampling_rate):
-    """Derive pre/post windows from median RR interval (35% / 55% of RR)."""
-    if len(peak_indices) < 2:
-        return 0.2, 0.5
-    rr_s = float(np.median(np.diff(peak_indices)) / sampling_rate)
-    pre  = round(round(min(max(rr_s * 0.35, 0.10), 0.40) / 0.05) * 0.05, 2)
-    post = round(round(min(max(rr_s * 0.55, 0.20), 0.80) / 0.05) * 0.05, 2)
-    return pre, post
-
-# Fingerprint peaks — auto-update slider defaults whenever peaks change
+# ── Auto beat windows (update on peak change) ────────────────────────────────
 _peaks_fp = (len(peak_indices), int(np.sum(peak_indices)) if len(peak_indices) else 0)
 if st.session_state.get("_peaks_fp") != _peaks_fp:
     _auto_pre, _auto_post = auto_beat_windows(peak_indices, sampling_rate)
-    st.session_state.beat_pre   = _auto_pre
-    st.session_state.beat_post  = _auto_post
-    st.session_state._peaks_fp  = _peaks_fp
+    st.session_state.beat_pre  = _auto_pre
+    st.session_state.beat_post = _auto_post
+    st.session_state._peaks_fp = _peaks_fp
 else:
-    # Ensure keys always exist before sliders render (first load with no peaks)
     st.session_state.setdefault("beat_pre",  0.2)
     st.session_state.setdefault("beat_post", 0.5)
 
-# ── HR Metrics ────────────────────────────────────────────────────────────────
+hr_mean, hr_min, hr_max = compute_hr_metrics(peak_indices, sampling_rate)
 
-def compute_hr_metrics(peak_indices, sampling_rate):
-    if len(peak_indices) < 2:
-        return None, None, None
-    rr_ms = np.diff(peak_indices) / sampling_rate * 1000
-    hr_inst = 60000 / rr_ms
-    return float(np.mean(hr_inst)), float(np.min(hr_inst)), float(np.max(hr_inst))
-
-
-# ── Layout: single-page with sticky right nav ─────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Layout: sticky right nav
+# ─────────────────────────────────────────────────────────────────────────────
 
 st.markdown("""
 <style>
 .toc-nav {
-    position: fixed;
-    top: 5rem;
-    right: 1.25rem;
-    z-index: 999;
-    background: rgba(14, 17, 23, 0.88);
-    backdrop-filter: blur(6px);
+    position: fixed; top: 5rem; right: 1.25rem; z-index: 999;
+    background: rgba(14, 17, 23, 0.88); backdrop-filter: blur(6px);
     -webkit-backdrop-filter: blur(6px);
     border-left: 2px solid rgba(255,255,255,0.1);
     border-radius: 0 6px 6px 0;
-    padding: 0.65rem 0.9rem 0.65rem 0.75rem;
-    min-width: 130px;
+    padding: 0.65rem 0.9rem 0.65rem 0.75rem; min-width: 130px;
 }
 .toc-nav a {
-    display: block;
-    padding: 0.3rem 0;
-    font-size: 0.75rem;
-    color: rgba(255,255,255,0.45);
-    text-decoration: none;
-    line-height: 1.3;
-    transition: color 0.15s;
-    white-space: nowrap;
+    display: block; padding: 0.3rem 0; font-size: 0.75rem;
+    color: rgba(255,255,255,0.45); text-decoration: none;
+    line-height: 1.3; transition: color 0.15s; white-space: nowrap;
 }
 .toc-nav a:hover { color: rgba(255,255,255,0.9); }
 .toc-title {
-    font-size: 0.65rem;
-    font-weight: 600;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: rgba(255,255,255,0.25);
-    margin-bottom: 0.4rem;
+    font-size: 0.65rem; font-weight: 600; letter-spacing: 0.08em;
+    text-transform: uppercase; color: rgba(255,255,255,0.25); margin-bottom: 0.4rem;
 }
 .section-anchor { scroll-margin-top: 5rem; }
 </style>
 """, unsafe_allow_html=True)
 
-# Fixed nav — rendered outside any column so it doesn't consume page width
 st.markdown("""
 <div class="toc-nav">
   <div class="toc-title">On this page</div>
@@ -905,20 +383,16 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-hr_mean, hr_min, hr_max = compute_hr_metrics(peak_indices, sampling_rate)
-
-
-# ── Time Window (top of main) ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Time Window slider
+# ─────────────────────────────────────────────────────────────────────────────
 
 st.subheader("Time Window")
 wc1, wc2 = st.columns([11, 1])
 with wc1:
     win_ms = st.slider(
-        "Analysis window",
-        min_value=_t0, max_value=_t1,
-        value=(_t0, _t1),
-        key="analysis_window",
-        label_visibility="collapsed",
+        "Analysis window", min_value=_t0, max_value=_t1, value=(_t0, _t1),
+        key="analysis_window", label_visibility="collapsed",
     )
 with wc2:
     if st.button("Reset", width="stretch", key="reset_main"):
@@ -928,48 +402,57 @@ with wc2:
 win_dur = (win_ms[1] - win_ms[0]) / 1000
 st.caption(f"{win_dur:.1f} s selected of {_duration_s:.1f} s total — box-select any chart below to zoom")
 
-# Apply window (re-apply mask for slider; transforms already applied above)
 mask = (timestamps_ms >= win_ms[0]) & (timestamps_ms <= win_ms[1])
 timestamps_w = timestamps_ms[mask]
 
 st.divider()
 
-# ── Section 1: Raw Data ───────────────────────────────────────────────────
+# Convenience shortcut used repeatedly below
+def _ex():
+    return make_export_df(timestamps_w, signal_w, cleaned, signals_df,
+                          signal_col, signal_bytes, sampling_rate,
+                          clean_method, peak_method, quality_methods)
+
+_c = signal_col.replace("-", "_")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Section 1: Raw Data
+# ─────────────────────────────────────────────────────────────────────────────
 
 st.markdown('<div class="section-anchor" id="raw-data"></div>', unsafe_allow_html=True)
 st.header("Raw Data")
 
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("Rows", len(df_raw))
-col2.metric("Columns", len(df_raw.columns))
+col1.metric("Rows",              len(df_raw))
+col2.metric("Columns",           len(df_raw.columns))
 col3.metric("Duration (window)", f"{(timestamps_w[-1] - timestamps_w[0]) / 1000:.1f} s")
-col4.metric("SR", f"{sampling_rate:.1f} Hz")
+col4.metric("SR",                f"{sampling_rate:.1f} Hz")
 
 st.caption("Box-select a region to zoom all charts")
-ev_raw = st.plotly_chart(plot_raw_signal(timestamps_w, signal_w, signal_col,
-                                         original=signal_w_orig if _signal_transformed else None,
-                                         baseline=_flip_baseline),
-                         width="stretch", key="chart_raw",
-                         on_select="rerun", selection_mode="box")
+ev_raw = st.plotly_chart(
+    plot_raw_signal(timestamps_w, signal_w, signal_col,
+                    original=signal_w_orig if _signal_transformed else None,
+                    baseline=_flip_baseline),
+    width="stretch", key="chart_raw", on_select="rerun", selection_mode="box",
+)
 _b = _extract_box_x(ev_raw)
 if _b:
     st.session_state._pending_window = (max(_t0, min(_b)), min(_t1, max(_b)))
     st.rerun()
 
 st.subheader("Signal Statistics")
-stats = pd.Series(signal_w, name=signal_col).describe()
-st.dataframe(stats.to_frame().T, width="stretch")
+st.dataframe(pd.Series(signal_w, name=signal_col).describe().to_frame().T, width="stretch")
 
 with st.expander("Data Preview (full file, head 200)"):
     st.dataframe(df_raw.head(200), width="stretch")
 
-_ex = make_export_df()
-_dl_button("Export Raw CSV", _ex[["timestamp_ms", f"{signal_col.replace('-','_')}_raw"]],
-           "raw_signal.csv", "dl_raw")
+_dl_button("Export Raw CSV", _ex()[["timestamp_ms", f"{_c}_raw"]], "raw_signal.csv", "dl_raw")
 
 st.divider()
 
-# ── Section 2: Processed Signal ──────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Section 2: Processed Signal
+# ─────────────────────────────────────────────────────────────────────────────
 
 st.markdown('<div class="section-anchor" id="processed-signal"></div>', unsafe_allow_html=True)
 st.header("Processed Signal")
@@ -984,22 +467,23 @@ show_raw_overlay = st.checkbox("Show raw signal", value=False, key="show_raw_ove
 st.caption("Box-select a region to zoom all charts")
 ev_proc = st.plotly_chart(
     plot_cleaned_overlay(timestamps_w, signal_w if show_raw_overlay else None, cleaned, signal_col),
-    width="stretch", key="chart_proc",
-    on_select="rerun", selection_mode="box")
+    width="stretch", key="chart_proc", on_select="rerun", selection_mode="box",
+)
 _b = _extract_box_x(ev_proc)
 if _b:
     st.session_state._pending_window = (max(_t0, min(_b)), min(_t1, max(_b)))
     st.rerun()
 st.caption(f"Cleaning method: **{clean_method}** | SR: **{sampling_rate:.1f} Hz**")
 
-_ex = make_export_df(); _c = signal_col.replace("-", "_")
 _dl_button("Export Processed CSV",
-           _ex[["timestamp_ms", f"{_c}_raw", f"{_c}_cleaned"]],
+           _ex()[["timestamp_ms", f"{_c}_raw", f"{_c}_cleaned"]],
            "processed_signal.csv", "dl_proc")
 
 st.divider()
 
-# ── Section 3: Peak Detection ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Section 3: Peak Detection
+# ─────────────────────────────────────────────────────────────────────────────
 
 st.markdown('<div class="section-anchor" id="peak-detection"></div>', unsafe_allow_html=True)
 st.header("Peak Detection")
@@ -1022,9 +506,8 @@ if hr_mean is not None:
 
 st.caption(f"Peak method: **{peak_method}** | Cleaning: **{clean_method}**")
 
-_ex = make_export_df(); _c = signal_col.replace("-", "_")
 _dl_button("Export Peaks CSV",
-           _ex[["timestamp_ms", f"{_c}_raw", f"{_c}_cleaned", "PPG_Peak", "PPG_Rate_bpm"]],
+           _ex()[["timestamp_ms", f"{_c}_raw", f"{_c}_cleaned", "PPG_Peak", "PPG_Rate_bpm"]],
            "peak_detection.csv", "dl_peaks")
 
 if show_nk_plot:
@@ -1038,7 +521,9 @@ if show_nk_plot:
 
 st.divider()
 
-# ── Section 4: Individual Beats ──────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Section 4: Individual Beats
+# ─────────────────────────────────────────────────────────────────────────────
 
 st.markdown('<div class="section-anchor" id="individual-beats"></div>', unsafe_allow_html=True)
 st.header("Individual Beats")
@@ -1051,19 +536,15 @@ if len(peak_indices) < 2:
 else:
     try:
         epochs = cached_epochs(
-            cleaned.tobytes(),
-            peak_indices.astype(np.int64).tobytes(),
+            cleaned.tobytes(), peak_indices.astype(np.int64).tobytes(),
             sampling_rate, -beat_pre, beat_post,
         )
         hr_mean_beats, _, _ = compute_hr_metrics(peak_indices, sampling_rate)
         st.plotly_chart(
             plot_individual_beats(epochs, hr_mean_beats),
-            width="stretch",
-            key=f"chart_beats_{beat_pre}_{beat_post}",
+            width="stretch", key=f"chart_beats_{beat_pre}_{beat_post}",
         )
-        st.caption(
-            f"{len(epochs)} beats | window: −{beat_pre}s to +{beat_post}s around each peak"
-        )
+        st.caption(f"{len(epochs)} beats | window: −{beat_pre}s to +{beat_post}s around each peak")
     except Exception as e:
         st.error(f"Beat segmentation failed: {e}")
 
@@ -1076,7 +557,9 @@ with bc2:
 
 st.divider()
 
-# ── Section 5: HRV / Analysis ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Section 5: HRV / Analysis
+# ─────────────────────────────────────────────────────────────────────────────
 
 st.markdown('<div class="section-anchor" id="hrv-analysis"></div>', unsafe_allow_html=True)
 st.header("HRV / Analysis")
@@ -1085,32 +568,27 @@ if analysis is not None:
     st.dataframe(analysis, width="stretch")
     csv_buf = io.BytesIO()
     analysis.to_csv(csv_buf, index=False)
-    st.download_button(
-        label="Download Analysis CSV",
-        data=csv_buf.getvalue(),
-        file_name="ppg_analysis.csv",
-        mime="text/csv",
-    )
+    st.download_button("Download Analysis CSV", csv_buf.getvalue(),
+                       "ppg_analysis.csv", "text/csv")
 else:
-    st.info("Window too short for full HRV analysis — widen the time window for entropy and frequency-domain metrics.")
+    st.info("Window too short for full HRV analysis — widen the time window.")
     st.dataframe(signals_df.head(500), width="stretch")
 
 st.divider()
 
-# ── Section 6: Signal Quality ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Section 6: Signal Quality
+# ─────────────────────────────────────────────────────────────────────────────
 
 st.markdown('<div class="section-anchor" id="signal-quality"></div>', unsafe_allow_html=True)
 st.header("Signal Quality")
 
 st.segmented_control(
     "Quality Methods", QUALITY_METHODS,
-    selection_mode="multi",
-    default=[QUALITY_METHODS[0]],
-    key="quality_methods",
+    selection_mode="multi", default=[QUALITY_METHODS[0]], key="quality_methods",
 )
 
-# Collect quality arrays for all selected methods
-_quality_map = {}
+_quality_map    = {}
 _quality_errors = {}
 for _qm in quality_methods:
     _qres = cached_pipeline(signal_bytes, sampling_rate, clean_method, peak_method, _qm)
@@ -1124,8 +602,7 @@ for _qm in quality_methods:
         _quality_errors[_qm] = "not available"
 
 if _quality_map:
-    # Align all arrays to the shortest length so x-axis matches
-    _common_len = min(len(v) for v in _quality_map.values())
+    _common_len  = min(len(v) for v in _quality_map.values())
     _aligned_map = {m: v[:_common_len] for m, v in _quality_map.items()}
     st.caption("Box-select a region to zoom all charts")
     ev_qual = st.plotly_chart(
@@ -1137,11 +614,11 @@ if _quality_map:
     if _b:
         st.session_state._pending_window = (max(_t0, min(_b)), min(_t1, max(_b)))
         st.rerun()
-    # Metrics row — one column per method
+
     _mcols = st.columns(max(1, len(_quality_map)))
     for _col, (_qm, _qa) in zip(_mcols, _quality_map.items()):
         _mean = float(np.nanmean(_qa))
-        _good_refs   = _QUALITY_REFS.get(_qm, [])
+        _good_refs   = QUALITY_REFS.get(_qm, [])
         _good_thresh = next((v for v, _, lbl in _good_refs if "good" in lbl or "boundary" in lbl), None)
         if _good_thresh is not None:
             _pct = float(np.mean(_qa >= _good_thresh) * 100)
@@ -1155,11 +632,12 @@ if _quality_map:
 for _qm, _err in _quality_errors.items():
     st.warning(f"**{_qm}**: `{_err}`")
 
-_ex = make_export_df(); _c = signal_col.replace("-", "_")
-_dl_button("Export Signal Quality CSV", _ex, "signal_quality.csv", "dl_qual")
+_dl_button("Export Signal Quality CSV", _ex(), "signal_quality.csv", "dl_qual")
 
-# ── Sidebar: all-in-one export (appended after pipeline runs) ─────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Sidebar: all-in-one export
+# ─────────────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
     st.divider()
-    _dl_button("Export All Data", make_export_df(), "all_data.csv", "dl_all")
+    _dl_button("Export All Data", _ex(), "all_data.csv", "dl_all")

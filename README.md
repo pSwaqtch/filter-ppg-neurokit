@@ -9,6 +9,17 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+## File Structure
+
+| File | Purpose |
+|---|---|
+| `app.py` | Streamlit UI — data loading, session state, `@st.cache_data` wrappers |
+| `ppg_processing.py` | **Pure signal processing** — no UI, no Plotly; the C-portable layer |
+| `ppg_charts.py` | Plotly chart builders — visualization only |
+| `ALGORITHM.md` | Algorithm reference with C pseudocode for porting |
+| `requirements.txt` | Python dependencies |
+| `data/` | Bundled demo files |
+
 Requires **Python 3.10+** (neurokit2 ≥0.2.10 uses `float | None` union syntax from PEP 604).
 
 ---
