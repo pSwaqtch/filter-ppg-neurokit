@@ -26,6 +26,10 @@ from ppg_charts import (
     plot_signal_overview, plot_raw_signal, plot_cleaned_overlay,
     plot_peaks, plot_individual_beats, plot_quality,
 )
+from usb_serial import (
+    SERIAL_AVAILABLE, list_serial_ports, describe_ports,
+    send_command, receive_binary_stream,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # App-level constants
@@ -175,6 +179,8 @@ def make_export_df(
 
 st.set_page_config(page_title="PPG Filter & Analysis", layout="wide")
 st.title("PPG Signal Filter & Analysis")
+
+_tab_analysis, _tab_serial = st.tabs(["Analysis", "USB Serial"])
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sidebar
@@ -344,10 +350,11 @@ else:
 hr_mean, hr_min, hr_max = compute_hr_metrics(peak_indices, sampling_rate)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Layout: sticky right nav
+# Tab 1: Analysis
 # ─────────────────────────────────────────────────────────────────────────────
 
-st.markdown("""
+with _tab_analysis:
+    st.markdown("""
 <style>
 .toc-nav {
     position: fixed; top: 5rem; right: 1.25rem; z-index: 999;
@@ -371,7 +378,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown("""
+    st.markdown("""
 <div class="toc-nav">
   <div class="toc-title">On this page</div>
   <a href="#raw-data">Raw Data</a>
@@ -383,259 +390,426 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Time Window slider
-# ─────────────────────────────────────────────────────────────────────────────
+    # ── Time Window slider ────────────────────────────────────────────────────
 
-st.subheader("Time Window")
-wc1, wc2 = st.columns([11, 1])
-with wc1:
-    win_ms = st.slider(
-        "Analysis window", min_value=_t0, max_value=_t1, value=(_t0, _t1),
-        key="analysis_window", label_visibility="collapsed",
-    )
-with wc2:
-    if st.button("Reset", width="stretch", key="reset_main"):
-        st.session_state._pending_window = (_t0, _t1)
-        st.rerun()
-
-win_dur = (win_ms[1] - win_ms[0]) / 1000
-st.caption(f"{win_dur:.1f} s selected of {_duration_s:.1f} s total — box-select any chart below to zoom")
-
-mask = (timestamps_ms >= win_ms[0]) & (timestamps_ms <= win_ms[1])
-timestamps_w = timestamps_ms[mask]
-
-st.divider()
-
-# Convenience shortcut used repeatedly below
-def _ex():
-    return make_export_df(timestamps_w, signal_w, cleaned, signals_df,
-                          signal_col, signal_bytes, sampling_rate,
-                          clean_method, peak_method, quality_methods)
-
-_c = signal_col.replace("-", "_")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Section 1: Raw Data
-# ─────────────────────────────────────────────────────────────────────────────
-
-st.markdown('<div class="section-anchor" id="raw-data"></div>', unsafe_allow_html=True)
-st.header("Raw Data")
-
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Rows",              len(df_raw))
-col2.metric("Columns",           len(df_raw.columns))
-col3.metric("Duration (window)", f"{(timestamps_w[-1] - timestamps_w[0]) / 1000:.1f} s")
-col4.metric("SR",                f"{sampling_rate:.1f} Hz")
-
-st.caption("Box-select a region to zoom all charts")
-ev_raw = st.plotly_chart(
-    plot_raw_signal(timestamps_w, signal_w, signal_col,
-                    original=signal_w_orig if _signal_transformed else None,
-                    baseline=_flip_baseline),
-    width="stretch", key="chart_raw", on_select="rerun", selection_mode="box",
-)
-_b = _extract_box_x(ev_raw)
-if _b:
-    st.session_state._pending_window = (max(_t0, min(_b)), min(_t1, max(_b)))
-    st.rerun()
-
-st.subheader("Signal Statistics")
-st.dataframe(pd.Series(signal_w, name=signal_col).describe().to_frame().T, width="stretch")
-
-with st.expander("Data Preview (full file, head 200)"):
-    st.dataframe(df_raw.head(200), width="stretch")
-
-_dl_button("Export Raw CSV", _ex()[["timestamp_ms", f"{_c}_raw"]], "raw_signal.csv", "dl_raw")
-
-st.divider()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Section 2: Processed Signal
-# ─────────────────────────────────────────────────────────────────────────────
-
-st.markdown('<div class="section-anchor" id="processed-signal"></div>', unsafe_allow_html=True)
-st.header("Processed Signal")
-
-_pcol1, _pcol2 = st.columns(2)
-_pcol1.selectbox("Cleaning Method", CLEAN_METHODS,
-                 index=CLEAN_METHODS.index(clean_method), key="clean_method")
-_pcol2.selectbox("Peak Detection Method", PEAK_METHODS,
-                 index=PEAK_METHODS.index(peak_method), key="peak_method")
-
-show_raw_overlay = st.checkbox("Show raw signal", value=False, key="show_raw_overlay")
-st.caption("Box-select a region to zoom all charts")
-ev_proc = st.plotly_chart(
-    plot_cleaned_overlay(timestamps_w, signal_w if show_raw_overlay else None, cleaned, signal_col),
-    width="stretch", key="chart_proc", on_select="rerun", selection_mode="box",
-)
-_b = _extract_box_x(ev_proc)
-if _b:
-    st.session_state._pending_window = (max(_t0, min(_b)), min(_t1, max(_b)))
-    st.rerun()
-st.caption(f"Cleaning method: **{clean_method}** | SR: **{sampling_rate:.1f} Hz**")
-
-_dl_button("Export Processed CSV",
-           _ex()[["timestamp_ms", f"{_c}_raw", f"{_c}_cleaned"]],
-           "processed_signal.csv", "dl_proc")
-
-st.divider()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Section 3: Peak Detection
-# ─────────────────────────────────────────────────────────────────────────────
-
-st.markdown('<div class="section-anchor" id="peak-detection"></div>', unsafe_allow_html=True)
-st.header("Peak Detection")
-
-st.caption("Box-select a region to zoom all charts")
-ev_peaks = st.plotly_chart(plot_peaks(timestamps_w, cleaned, peak_indices),
-                           width="stretch", key="chart_peaks",
-                           on_select="rerun", selection_mode="box")
-_b = _extract_box_x(ev_peaks)
-if _b:
-    st.session_state._pending_window = (max(_t0, min(_b)), min(_t1, max(_b)))
-    st.rerun()
-
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Peaks Detected", len(peak_indices))
-if hr_mean is not None:
-    m2.metric("Mean HR", f"{hr_mean:.1f} bpm")
-    m3.metric("Min HR",  f"{hr_min:.1f} bpm")
-    m4.metric("Max HR",  f"{hr_max:.1f} bpm")
-
-st.caption(f"Peak method: **{peak_method}** | Cleaning: **{clean_method}**")
-
-_dl_button("Export Peaks CSV",
-           _ex()[["timestamp_ms", f"{_c}_raw", f"{_c}_cleaned", "PPG_Peak", "PPG_Rate_bpm"]],
-           "peak_detection.csv", "dl_peaks")
-
-if show_nk_plot:
-    with st.expander("NeuroKit2 Native Plot", expanded=True):
-        try:
-            fig_nk = nk.ppg_plot(signals_df, info)
-            st.pyplot(fig_nk)
-            plt.close(fig_nk)
-        except Exception as e:
-            st.warning(f"Could not render NeuroKit2 native plot: {e}")
-
-st.divider()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Section 4: Individual Beats
-# ─────────────────────────────────────────────────────────────────────────────
-
-st.markdown('<div class="section-anchor" id="individual-beats"></div>', unsafe_allow_html=True)
-st.header("Individual Beats")
-
-beat_pre  = st.session_state.get("beat_pre",  0.2)
-beat_post = st.session_state.get("beat_post", 0.5)
-
-if len(peak_indices) < 2:
-    st.warning("Not enough peaks detected to segment individual beats.")
-else:
-    try:
-        epochs = cached_epochs(
-            cleaned.tobytes(), peak_indices.astype(np.int64).tobytes(),
-            sampling_rate, -beat_pre, beat_post,
+    st.subheader("Time Window")
+    wc1, wc2 = st.columns([11, 1])
+    with wc1:
+        win_ms = st.slider(
+            "Analysis window", min_value=_t0, max_value=_t1, value=(_t0, _t1),
+            key="analysis_window", label_visibility="collapsed",
         )
-        hr_mean_beats, _, _ = compute_hr_metrics(peak_indices, sampling_rate)
-        st.plotly_chart(
-            plot_individual_beats(epochs, hr_mean_beats),
-            width="stretch", key=f"chart_beats_{beat_pre}_{beat_post}",
-        )
-        st.caption(f"{len(epochs)} beats | window: −{beat_pre}s to +{beat_post}s around each peak")
-    except Exception as e:
-        st.error(f"Beat segmentation failed: {e}")
+    with wc2:
+        if st.button("Reset", width="stretch", key="reset_main"):
+            st.session_state._pending_window = (_t0, _t1)
+            st.rerun()
 
-st.subheader("Beat Segmentation")
-bc1, bc2 = st.columns(2)
-with bc1:
-    st.slider("Pre-peak window (s)",  0.1, 0.5, step=0.05, key="beat_pre")
-with bc2:
-    st.slider("Post-peak window (s)", 0.2, 1.0, step=0.05, key="beat_post")
+    win_dur = (win_ms[1] - win_ms[0]) / 1000
+    st.caption(f"{win_dur:.1f} s selected of {_duration_s:.1f} s total — box-select any chart below to zoom")
 
-st.divider()
+    mask = (timestamps_ms >= win_ms[0]) & (timestamps_ms <= win_ms[1])
+    timestamps_w = timestamps_ms[mask]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Section 5: HRV / Analysis
-# ─────────────────────────────────────────────────────────────────────────────
+    st.divider()
 
-st.markdown('<div class="section-anchor" id="hrv-analysis"></div>', unsafe_allow_html=True)
-st.header("HRV / Analysis")
+    # Convenience shortcut used repeatedly below
+    def _ex():
+        return make_export_df(timestamps_w, signal_w, cleaned, signals_df,
+                              signal_col, signal_bytes, sampling_rate,
+                              clean_method, peak_method, quality_methods)
 
-if analysis is not None:
-    st.dataframe(analysis, width="stretch")
-    csv_buf = io.BytesIO()
-    analysis.to_csv(csv_buf, index=False)
-    st.download_button("Download Analysis CSV", csv_buf.getvalue(),
-                       "ppg_analysis.csv", "text/csv")
-else:
-    st.info("Window too short for full HRV analysis — widen the time window.")
-    st.dataframe(signals_df.head(500), width="stretch")
+    _c = signal_col.replace("-", "_")
 
-st.divider()
+    # ── Section 1: Raw Data ───────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Section 6: Signal Quality
-# ─────────────────────────────────────────────────────────────────────────────
+    st.markdown('<div class="section-anchor" id="raw-data"></div>', unsafe_allow_html=True)
+    st.header("Raw Data")
 
-st.markdown('<div class="section-anchor" id="signal-quality"></div>', unsafe_allow_html=True)
-st.header("Signal Quality")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Rows",              len(df_raw))
+    col2.metric("Columns",           len(df_raw.columns))
+    col3.metric("Duration (window)", f"{(timestamps_w[-1] - timestamps_w[0]) / 1000:.1f} s")
+    col4.metric("SR",                f"{sampling_rate:.1f} Hz")
 
-st.segmented_control(
-    "Quality Methods", QUALITY_METHODS,
-    selection_mode="multi", default=[QUALITY_METHODS[0]], key="quality_methods",
-)
-
-_quality_map    = {}
-_quality_errors = {}
-for _qm in quality_methods:
-    _qres = cached_pipeline(signal_bytes, sampling_rate, clean_method, peak_method, _qm)
-    if _qres["quality"] is not None:
-        _qa = np.array(_qres["quality"])
-        _minlen = min(len(timestamps_w), len(_qa))
-        _quality_map[_qm] = _qa[:_minlen]
-    elif _qres["quality_error"]:
-        _quality_errors[_qm] = _qres["quality_error"]
-    else:
-        _quality_errors[_qm] = "not available"
-
-if _quality_map:
-    _common_len  = min(len(v) for v in _quality_map.values())
-    _aligned_map = {m: v[:_common_len] for m, v in _quality_map.items()}
     st.caption("Box-select a region to zoom all charts")
-    ev_qual = st.plotly_chart(
-        plot_quality(timestamps_w[:_common_len], _aligned_map),
-        width="stretch", key=f"chart_qual_{'_'.join(quality_methods)}",
-        on_select="rerun", selection_mode="box",
+    ev_raw = st.plotly_chart(
+        plot_raw_signal(timestamps_w, signal_w, signal_col,
+                        original=signal_w_orig if _signal_transformed else None,
+                        baseline=_flip_baseline),
+        width="stretch", key="chart_raw", on_select="rerun", selection_mode="box",
     )
-    _b = _extract_box_x(ev_qual)
+    _b = _extract_box_x(ev_raw)
     if _b:
         st.session_state._pending_window = (max(_t0, min(_b)), min(_t1, max(_b)))
         st.rerun()
 
-    _mcols = st.columns(max(1, len(_quality_map)))
-    for _col, (_qm, _qa) in zip(_mcols, _quality_map.items()):
-        _mean = float(np.nanmean(_qa))
-        _good_refs   = QUALITY_REFS.get(_qm, [])
-        _good_thresh = next((v for v, _, lbl in _good_refs if "good" in lbl or "boundary" in lbl), None)
-        if _good_thresh is not None:
-            _pct = float(np.mean(_qa >= _good_thresh) * 100)
-            _col.metric(f"{_qm}", f"{_mean:.3f}", f"{_pct:.0f}% above {_good_thresh}")
-        elif _qm == "skewness":
-            _pct = float(np.mean(_qa >= 0.0) * 100)
-            _col.metric(f"{_qm}", f"{_mean:.3f}", f"{_pct:.0f}% above 0")
+    st.subheader("Signal Statistics")
+    st.dataframe(pd.Series(signal_w, name=signal_col).describe().to_frame().T, width="stretch")
+
+    with st.expander("Data Preview (full file, head 200)"):
+        st.dataframe(df_raw.head(200), width="stretch")
+
+    _dl_button("Export Raw CSV", _ex()[["timestamp_ms", f"{_c}_raw"]], "raw_signal.csv", "dl_raw")
+
+    st.divider()
+
+    # ── Section 2: Processed Signal ───────────────────────────────────────────
+
+    st.markdown('<div class="section-anchor" id="processed-signal"></div>', unsafe_allow_html=True)
+    st.header("Processed Signal")
+
+    _pcol1, _pcol2 = st.columns(2)
+    _pcol1.selectbox("Cleaning Method", CLEAN_METHODS,
+                     index=CLEAN_METHODS.index(clean_method), key="clean_method")
+    _pcol2.selectbox("Peak Detection Method", PEAK_METHODS,
+                     index=PEAK_METHODS.index(peak_method), key="peak_method")
+
+    show_raw_overlay = st.checkbox("Show raw signal", value=False, key="show_raw_overlay")
+    st.caption("Box-select a region to zoom all charts")
+    ev_proc = st.plotly_chart(
+        plot_cleaned_overlay(timestamps_w, signal_w if show_raw_overlay else None, cleaned, signal_col),
+        width="stretch", key="chart_proc", on_select="rerun", selection_mode="box",
+    )
+    _b = _extract_box_x(ev_proc)
+    if _b:
+        st.session_state._pending_window = (max(_t0, min(_b)), min(_t1, max(_b)))
+        st.rerun()
+    st.caption(f"Cleaning method: **{clean_method}** | SR: **{sampling_rate:.1f} Hz**")
+
+    _dl_button("Export Processed CSV",
+               _ex()[["timestamp_ms", f"{_c}_raw", f"{_c}_cleaned"]],
+               "processed_signal.csv", "dl_proc")
+
+    st.divider()
+
+    # ── Section 3: Peak Detection ─────────────────────────────────────────────
+
+    st.markdown('<div class="section-anchor" id="peak-detection"></div>', unsafe_allow_html=True)
+    st.header("Peak Detection")
+
+    st.caption("Box-select a region to zoom all charts")
+    ev_peaks = st.plotly_chart(plot_peaks(timestamps_w, cleaned, peak_indices),
+                               width="stretch", key="chart_peaks",
+                               on_select="rerun", selection_mode="box")
+    _b = _extract_box_x(ev_peaks)
+    if _b:
+        st.session_state._pending_window = (max(_t0, min(_b)), min(_t1, max(_b)))
+        st.rerun()
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Peaks Detected", len(peak_indices))
+    if hr_mean is not None:
+        m2.metric("Mean HR", f"{hr_mean:.1f} bpm")
+        m3.metric("Min HR",  f"{hr_min:.1f} bpm")
+        m4.metric("Max HR",  f"{hr_max:.1f} bpm")
+
+    st.caption(f"Peak method: **{peak_method}** | Cleaning: **{clean_method}**")
+
+    _dl_button("Export Peaks CSV",
+               _ex()[["timestamp_ms", f"{_c}_raw", f"{_c}_cleaned", "PPG_Peak", "PPG_Rate_bpm"]],
+               "peak_detection.csv", "dl_peaks")
+
+    if show_nk_plot:
+        with st.expander("NeuroKit2 Native Plot", expanded=True):
+            try:
+                fig_nk = nk.ppg_plot(signals_df, info)
+                st.pyplot(fig_nk)
+                plt.close(fig_nk)
+            except Exception as e:
+                st.warning(f"Could not render NeuroKit2 native plot: {e}")
+
+    st.divider()
+
+    # ── Section 4: Individual Beats ───────────────────────────────────────────
+
+    st.markdown('<div class="section-anchor" id="individual-beats"></div>', unsafe_allow_html=True)
+    st.header("Individual Beats")
+
+    beat_pre  = st.session_state.get("beat_pre",  0.2)
+    beat_post = st.session_state.get("beat_post", 0.5)
+
+    if len(peak_indices) < 2:
+        st.warning("Not enough peaks detected to segment individual beats.")
+    else:
+        try:
+            epochs = cached_epochs(
+                cleaned.tobytes(), peak_indices.astype(np.int64).tobytes(),
+                sampling_rate, -beat_pre, beat_post,
+            )
+            hr_mean_beats, _, _ = compute_hr_metrics(peak_indices, sampling_rate)
+            st.plotly_chart(
+                plot_individual_beats(epochs, hr_mean_beats),
+                width="stretch", key=f"chart_beats_{beat_pre}_{beat_post}",
+            )
+            st.caption(f"{len(epochs)} beats | window: −{beat_pre}s to +{beat_post}s around each peak")
+        except Exception as e:
+            st.error(f"Beat segmentation failed: {e}")
+
+    st.subheader("Beat Segmentation")
+    bc1, bc2 = st.columns(2)
+    with bc1:
+        st.slider("Pre-peak window (s)",  0.1, 0.5, step=0.05, key="beat_pre")
+    with bc2:
+        st.slider("Post-peak window (s)", 0.2, 1.0, step=0.05, key="beat_post")
+
+    st.divider()
+
+    # ── Section 5: HRV / Analysis ─────────────────────────────────────────────
+
+    st.markdown('<div class="section-anchor" id="hrv-analysis"></div>', unsafe_allow_html=True)
+    st.header("HRV / Analysis")
+
+    if analysis is not None:
+        st.dataframe(analysis, width="stretch")
+        csv_buf = io.BytesIO()
+        analysis.to_csv(csv_buf, index=False)
+        st.download_button("Download Analysis CSV", csv_buf.getvalue(),
+                           "ppg_analysis.csv", "text/csv")
+    else:
+        st.info("Window too short for full HRV analysis — widen the time window.")
+        st.dataframe(signals_df.head(500), width="stretch")
+
+    st.divider()
+
+    # ── Section 6: Signal Quality ─────────────────────────────────────────────
+
+    st.markdown('<div class="section-anchor" id="signal-quality"></div>', unsafe_allow_html=True)
+    st.header("Signal Quality")
+
+    st.segmented_control(
+        "Quality Methods", QUALITY_METHODS,
+        selection_mode="multi", default=[QUALITY_METHODS[0]], key="quality_methods",
+    )
+
+    _quality_map    = {}
+    _quality_errors = {}
+    for _qm in quality_methods:
+        _qres = cached_pipeline(signal_bytes, sampling_rate, clean_method, peak_method, _qm)
+        if _qres["quality"] is not None:
+            _qa = np.array(_qres["quality"])
+            _minlen = min(len(timestamps_w), len(_qa))
+            _quality_map[_qm] = _qa[:_minlen]
+        elif _qres["quality_error"]:
+            _quality_errors[_qm] = _qres["quality_error"]
         else:
-            _col.metric(f"{_qm}", f"{_mean:.3f}", f"σ={float(np.nanstd(_qa)):.3f}")
+            _quality_errors[_qm] = "not available"
 
-for _qm, _err in _quality_errors.items():
-    st.warning(f"**{_qm}**: `{_err}`")
+    if _quality_map:
+        _common_len  = min(len(v) for v in _quality_map.values())
+        _aligned_map = {m: v[:_common_len] for m, v in _quality_map.items()}
+        st.caption("Box-select a region to zoom all charts")
+        ev_qual = st.plotly_chart(
+            plot_quality(timestamps_w[:_common_len], _aligned_map),
+            width="stretch", key=f"chart_qual_{'_'.join(quality_methods)}",
+            on_select="rerun", selection_mode="box",
+        )
+        _b = _extract_box_x(ev_qual)
+        if _b:
+            st.session_state._pending_window = (max(_t0, min(_b)), min(_t1, max(_b)))
+            st.rerun()
 
-_dl_button("Export Signal Quality CSV", _ex(), "signal_quality.csv", "dl_qual")
+        _mcols = st.columns(max(1, len(_quality_map)))
+        for _col, (_qm, _qa) in zip(_mcols, _quality_map.items()):
+            _mean = float(np.nanmean(_qa))
+            _good_refs   = QUALITY_REFS.get(_qm, [])
+            _good_thresh = next((v for v, _, lbl in _good_refs if "good" in lbl or "boundary" in lbl), None)
+            if _good_thresh is not None:
+                _pct = float(np.mean(_qa >= _good_thresh) * 100)
+                _col.metric(f"{_qm}", f"{_mean:.3f}", f"{_pct:.0f}% above {_good_thresh}")
+            elif _qm == "skewness":
+                _pct = float(np.mean(_qa >= 0.0) * 100)
+                _col.metric(f"{_qm}", f"{_mean:.3f}", f"{_pct:.0f}% above 0")
+            else:
+                _col.metric(f"{_qm}", f"{_mean:.3f}", f"σ={float(np.nanstd(_qa)):.3f}")
+
+    for _qm, _err in _quality_errors.items():
+        st.warning(f"**{_qm}**: `{_err}`")
+
+    _dl_button("Export Signal Quality CSV", _ex(), "signal_quality.csv", "dl_qual")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sidebar: all-in-one export
+# Tab 2: USB Serial
+# ─────────────────────────────────────────────────────────────────────────────
+
+with _tab_serial:
+    st.header("USB Serial")
+
+    if not SERIAL_AVAILABLE:
+        st.error("`pyserial` is not installed. Run: `pip install pyserial`")
+        st.stop()
+
+    # ── Connection settings ───────────────────────────────────────────────────
+
+    _ports = list_serial_ports()
+    _sc1, _sc2, _sc3 = st.columns([3, 2, 1])
+
+    with _sc1:
+        if _ports:
+            _port = st.selectbox("Serial Port", _ports, key="serial_port")
+        else:
+            _port = st.text_input("Serial Port (manual)", value="/dev/tty.usbmodem101",
+                                  key="serial_port_manual")
+    with _sc2:
+        _baud = st.selectbox("Baud Rate", [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600],
+                             index=4, key="serial_baud")
+    with _sc3:
+        if st.button("Refresh Ports", width="stretch"):
+            st.rerun()
+
+    if _ports:
+        _port_descs = {p["device"]: p["description"] for p in describe_ports()}
+        if _port in _port_descs:
+            st.caption(f"Device: {_port_descs[_port]}")
+
+    st.divider()
+
+    # ── Command console ───────────────────────────────────────────────────────
+
+    st.subheader("Command Console")
+    st.caption("Send any text command to the device and see the response.")
+
+    _cmd_col1, _cmd_col2 = st.columns([5, 1])
+    with _cmd_col1:
+        _cmd_input = st.text_input(
+            "Command", value="adpd stream-bin 100", key="serial_cmd_input",
+            label_visibility="collapsed", placeholder="Enter command…",
+        )
+    with _cmd_col2:
+        _send_clicked = st.button("Send", width="stretch", key="serial_send_btn")
+
+    _resp_timeout = st.number_input("Response timeout (s)", min_value=0.5, max_value=30.0,
+                                    value=3.0, step=0.5, key="serial_resp_timeout")
+
+    if _send_clicked and _cmd_input.strip():
+        with st.spinner(f"Sending: `{_cmd_input.strip()}`…"):
+            _result = send_command(_port, _baud, _cmd_input.strip(),
+                                   response_timeout_s=_resp_timeout)
+        if _result.ok:
+            st.success("Command sent")
+            if _result.response:
+                st.code(_result.response, language="text")
+            else:
+                st.info("No response received within timeout.")
+        else:
+            st.error(f"Error: {_result.error}")
+
+    # Command history quick-pick
+    with st.expander("Common Commands"):
+        _common_cmds = [
+            "adpd stream-bin 100",
+            "adpd stream-bin 500",
+            "adpd stream-bin 1000",
+            "adpd start",
+            "adpd stop",
+            "adpd status",
+            "help",
+        ]
+        for _cc in _common_cmds:
+            if st.button(_cc, key=f"cmd_preset_{_cc}"):
+                st.session_state["serial_cmd_input"] = _cc
+                st.rerun()
+
+    st.divider()
+
+    # ── Binary stream capture ─────────────────────────────────────────────────
+
+    st.subheader("Binary Stream Capture")
+    st.caption("Sends `adpd stream-bin N` and parses the 4-byte little-endian uint32 payload.")
+
+    _bs1, _bs2 = st.columns(2)
+    with _bs1:
+        _n_samples = st.number_input("Samples to capture", min_value=10, max_value=100000,
+                                     value=500, step=50, key="serial_n_samples")
+    with _bs2:
+        _stream_timeout = st.number_input("Stream timeout (s)", min_value=5.0, max_value=120.0,
+                                          value=30.0, step=5.0, key="serial_stream_timeout")
+
+    _capture_btn = st.button("Capture Stream", type="primary", width="stretch",
+                             key="serial_capture_btn")
+
+    if _capture_btn:
+        _progress_bar = st.progress(0, text="Waiting for start marker…")
+
+        def _update_progress(received: int, total: int):
+            pct = min(int(received / total * 100), 100)
+            _progress_bar.progress(pct, text=f"Receiving… {received}/{total} samples")
+
+        with st.spinner("Streaming…"):
+            _stream = receive_binary_stream(
+                _port, _baud, int(_n_samples),
+                stream_timeout_s=_stream_timeout,
+                progress_cb=_update_progress,
+            )
+
+        _progress_bar.empty()
+
+        if _stream.ok and _stream.count > 0:
+            st.success(f"Captured {_stream.count} samples")
+
+            # Store in session state so it persists across reruns
+            st.session_state["serial_last_samples"] = _stream.samples
+            st.session_state["serial_last_log"]     = _stream.log
+
+        elif not _stream.ok:
+            st.error(f"Stream error: {_stream.error}")
+        else:
+            st.warning("No samples received.")
+            if _stream.log:
+                st.code("\n".join(_stream.log), language="text")
+
+    # ── Display captured data ─────────────────────────────────────────────────
+
+    _samples = st.session_state.get("serial_last_samples", [])
+    _log     = st.session_state.get("serial_last_log", [])
+
+    if _samples:
+        import plotly.graph_objects as _go
+
+        _fig_serial = _go.Figure()
+        _fig_serial.add_trace(_go.Scatter(
+            x=list(range(len(_samples))), y=_samples,
+            mode="lines", line=dict(color="#1f77b4", width=1),
+            name="raw ADC",
+        ))
+        _fig_serial.update_layout(
+            xaxis_title="Sample index",
+            yaxis_title="ADC value (uint32)",
+            margin=dict(l=0, r=0, t=30, b=0),
+            height=350,
+        )
+        st.plotly_chart(_fig_serial, width="stretch", key="chart_serial_raw")
+
+        _s_col1, _s_col2, _s_col3, _s_col4 = st.columns(4)
+        _s_col1.metric("Samples",  len(_samples))
+        _s_col2.metric("Min",      f"{min(_samples):,}")
+        _s_col3.metric("Max",      f"{max(_samples):,}")
+        _s_col4.metric("Mean",     f"{int(sum(_samples) / len(_samples)):,}")
+
+        # Export captured data as CSV
+        _serial_df = pd.DataFrame({
+            "sample_index": range(len(_samples)),
+            "adc_raw": _samples,
+        })
+        st.download_button(
+            "Export Captured CSV",
+            _serial_df.to_csv(index=False).encode(),
+            "serial_capture.csv", "text/csv",
+            key="dl_serial",
+        )
+
+    if _log:
+        with st.expander("Stream log"):
+            st.code("\n".join(_log), language="text")
+
+    # ── Clear ─────────────────────────────────────────────────────────────────
+
+    if _samples and st.button("Clear Captured Data", key="serial_clear"):
+        st.session_state.pop("serial_last_samples", None)
+        st.session_state.pop("serial_last_log", None)
+        st.rerun()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sidebar: all-in-one export (Analysis tab only)
 # ─────────────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
