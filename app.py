@@ -1310,7 +1310,7 @@ with _tab_serial:
     for _i, _tok in enumerate(_tokens):
         with _row_cols[_i]:
             if st.button(f"{_tok}  ×", key=f"chip_rm_{_i}",
-                         use_container_width=True, help=f"Remove '{_tok}'"):
+                         width="content", help=f"Remove '{_tok}'"):
                 st.session_state["_cmd_tokens"].pop(_i)
                 st.session_state["_cmd_next_select"] = None
                 st.rerun()
