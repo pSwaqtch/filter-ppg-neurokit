@@ -795,24 +795,38 @@ with _tab_serial:
         "help",
     ]
 
-    _cmd_input = st.selectbox(
-        "Command",
-        options=_KNOWN_CMDS,
-        index=None,
-        placeholder="Type a command…",
-        accept_new_options=True,
+    # on_change fills the text input BEFORE it renders — avoids SessionState conflict
+    def _apply_preset():
+        preset = st.session_state.get("_cmd_preset")
+        if preset:
+            st.session_state["serial_cmd_input"] = preset
+            st.session_state["_cmd_preset"] = None
+
+    st.selectbox(
+        "Preset commands",
+        options=[""] + _KNOWN_CMDS,
+        index=0,
+        format_func=lambda x: "— pick a preset —" if x == "" else x,
+        key="_cmd_preset",
+        on_change=_apply_preset,
         label_visibility="collapsed",
+    )
+
+    _cmd_input = st.text_input(
+        "Command",
         key="serial_cmd_input",
+        label_visibility="collapsed",
+        placeholder="Type any command…",
     )
 
     _resp_timeout = st.number_input("Response timeout (s)", min_value=0.5, max_value=30.0,
                                     value=3.0, step=0.5, key="serial_resp_timeout")
 
     _send_clicked = st.button("Send", type="primary", width="stretch", key="serial_send_btn",
-                              disabled=not bool(_cmd_input and str(_cmd_input).strip()))
+                              disabled=not bool(_cmd_input and _cmd_input.strip()))
 
-    if _send_clicked and _cmd_input and str(_cmd_input).strip():
-        _cmd_str = str(_cmd_input).strip()
+    if _send_clicked and _cmd_input and _cmd_input.strip():
+        _cmd_str = _cmd_input.strip()
         with st.spinner(f"Sending: `{_cmd_str}`…"):
             _result = send_command(_active_port, _active_baud, _cmd_str,
                                    response_timeout_s=_resp_timeout)
