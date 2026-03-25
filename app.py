@@ -1296,82 +1296,77 @@ with _tab_serial:
     _cmd_str = " ".join(str(t) for t in _tokens)
     _can_send = _node is None or (isinstance(_node, dict) and _node.get("_optional_end"))
 
-    # ── Chip strip + backspace/clear ──────────────────────────────────────────
-    _chip_css = (
-        "display:inline-flex; align-items:center; padding:2px 10px; margin:2px 3px; "
-        "border-radius:14px; background:#1a3550; color:#7ec8e3; "
-        "font-size:0.82rem; font-family:monospace; font-weight:600;"
-    )
-    if _tokens:
-        _chips_html = "".join(f'<span style="{_chip_css}">{t}</span>' for t in _tokens)
-        st.markdown(
-            f'<div style="margin:4px 0 6px 0; line-height:2.2">{_chips_html}</div>',
-            unsafe_allow_html=True,
-        )
-        _bk_col, _rst_col, _ = st.columns([1, 1, 6])
-        with _bk_col:
-            if st.button("⌫", key="cmd_backspace", help="Remove last token", width="stretch"):
-                st.session_state["_cmd_tokens"].pop()
-                st.session_state["_cmd_next_select"] = None
-                st.rerun()
-        with _rst_col:
-            if st.button("✕", key="cmd_reset_chips", help="Clear all", width="stretch"):
-                st.session_state["_cmd_tokens"] = []
+    # ── Inline chip row + search bar ──────────────────────────────────────────
+    # Each token is a narrow column with a chip-button (click × to remove).
+    # The search bar / value input occupies the remaining width at the right.
+    _is_value_node = isinstance(_node, dict) and "_input" in _node
+    _is_dict_node  = isinstance(_node, dict) and "_input" not in _node
+
+    # Column widths: ~1.5 units per token chip, 4 units for input
+    _col_weights = [max(1, len(t)) for t in _tokens] + [5]
+    _row_cols    = st.columns(_col_weights) if _tokens else [None]
+
+    # Chip buttons (all columns except last)
+    for _i, _tok in enumerate(_tokens):
+        with _row_cols[_i]:
+            if st.button(f"{_tok}  ×", key=f"chip_rm_{_i}",
+                         use_container_width=True, help=f"Remove '{_tok}'"):
+                st.session_state["_cmd_tokens"].pop(_i)
                 st.session_state["_cmd_next_select"] = None
                 st.rerun()
 
-    # ── Single persistent search bar (dict nodes) ─────────────────────────────
-    if isinstance(_node, dict) and "_input" not in _node:
-        _choices = [k for k in _node if not k.startswith("_")]
-        if _choices:
-            def _on_token_select():
-                val = st.session_state.get("_cmd_next_select")
-                if val is not None:
-                    st.session_state["_cmd_tokens"].append(val)
-                    st.session_state["_cmd_next_select"] = None
+    # Input column (last column, or full width if no chips yet)
+    _input_col = _row_cols[-1] if _tokens else st.container()
 
-            st.selectbox(
-                "token",
-                options=_choices,
-                index=None,
-                placeholder="type to search…",
-                key="_cmd_next_select",
-                on_change=_on_token_select,
-                label_visibility="collapsed",
-            )
+    with _input_col:
+        if _is_dict_node:
+            _choices = [k for k in _node if not k.startswith("_")]
+            if _choices:
+                def _on_token_select():
+                    val = st.session_state.get("_cmd_next_select")
+                    if val is not None:
+                        st.session_state["_cmd_tokens"].append(val)
+                        st.session_state["_cmd_next_select"] = None
 
-    # ── Value input (number / hex / odr) ──────────────────────────────────────
-    elif isinstance(_node, dict) and "_input" in _node:
-        _itype  = _node["_input"]
-        _ilabel = _node.get("_label", "value")
-        _iopts  = _node.get("_options")
-
-        _iv_col, _iadd_col = st.columns([5, 1])
-        with _iv_col:
-            if _itype == "odr":
-                _ival = st.selectbox(
-                    _ilabel, options=_iopts, index=None,
-                    placeholder="select ODR (Hz)…",
-                    key=f"_cmd_ival_{len(_tokens)}",
+                st.selectbox(
+                    "token", options=_choices, index=None,
+                    placeholder="type to search…",
+                    key="_cmd_next_select",
+                    on_change=_on_token_select,
                     label_visibility="collapsed",
                 )
-            elif _itype == "count":
-                _ival = st.number_input(
-                    _ilabel, min_value=1, max_value=100_000, value=None, step=50,
-                    key=f"_cmd_ival_{len(_tokens)}",
-                    placeholder=_ilabel, label_visibility="collapsed",
-                )
-            else:   # hex / free text
-                _ival = st.text_input(
-                    _ilabel, key=f"_cmd_ival_{len(_tokens)}",
-                    placeholder=_ilabel, label_visibility="collapsed",
-                )
-        with _iadd_col:
-            _ival_ok = _ival is not None and str(_ival).strip() != ""
-            if st.button("Add →", key="cmd_add_val", type="primary",
-                         width="stretch", disabled=not _ival_ok):
-                st.session_state["_cmd_tokens"].append(str(_ival).strip())
-                st.rerun()
+
+        elif _is_value_node:
+            _itype  = _node["_input"]
+            _ilabel = _node.get("_label", "value")
+            _iopts  = _node.get("_options")
+
+            _iv_col, _iadd_col = st.columns([4, 1])
+            with _iv_col:
+                if _itype == "odr":
+                    _ival = st.selectbox(
+                        _ilabel, options=_iopts, index=None,
+                        placeholder="select ODR (Hz)…",
+                        key=f"_cmd_ival_{len(_tokens)}",
+                        label_visibility="collapsed",
+                    )
+                elif _itype == "count":
+                    _ival = st.number_input(
+                        _ilabel, min_value=1, max_value=100_000, value=None, step=50,
+                        key=f"_cmd_ival_{len(_tokens)}",
+                        placeholder=_ilabel, label_visibility="collapsed",
+                    )
+                else:
+                    _ival = st.text_input(
+                        _ilabel, key=f"_cmd_ival_{len(_tokens)}",
+                        placeholder=_ilabel, label_visibility="collapsed",
+                    )
+            with _iadd_col:
+                _ival_ok = _ival is not None and str(_ival).strip() != ""
+                if st.button("Add →", key="cmd_add_val", type="primary",
+                             width="stretch", disabled=not _ival_ok):
+                    st.session_state["_cmd_tokens"].append(str(_ival).strip())
+                    st.rerun()
 
     # ── Send ──────────────────────────────────────────────────────────────────
     if _tokens and _can_send:
