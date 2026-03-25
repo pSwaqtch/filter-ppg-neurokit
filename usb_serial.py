@@ -66,8 +66,13 @@ class CommandResult:
 
 @dataclass
 class StreamResult:
-    """Outcome of a binary stream capture."""
-    samples: list[int] = field(default_factory=list)
+    """Outcome of a binary stream capture.
+
+    ``samples`` is a list of (ch1, ch2, ch3, ch4) tuples — one per sample.
+    Each channel value is a little-endian uint32.
+    Ch3/Ch4 carry the PPG signal (IN3 pair); Ch1/Ch2 are ambient.
+    """
+    samples: list[tuple[int, int, int, int]] = field(default_factory=list)
     log: list[str] = field(default_factory=list)
     error: Optional[str] = None
 
@@ -186,6 +191,10 @@ def send_command(
         return CommandResult(command=command, error=f"Unexpected error: {exc}")
 
 
+BYTES_PER_SAMPLE = 16   # 4 channels × 4 bytes each
+CHANNELS = ("ch1", "ch2", "ch3", "ch4")
+
+
 def receive_binary_stream(
     port: str,
     baud: int,
@@ -193,12 +202,14 @@ def receive_binary_stream(
     stream_timeout_s: float = 30.0,
     progress_cb=None,
 ) -> StreamResult:
-    """Send ``adpd stream-bin <num_samples>`` and parse the binary response.
+    """Send ``adpd ppg stream-bin <num_samples>`` and parse the binary response.
 
-    The device emits:
-    1. A text start-marker line.
-    2. ``num_samples × 4`` raw bytes (little-endian uint32 each).
-    3. A text end-marker line.
+    Protocol (BINARY_STREAMING.md):
+    1. Text start marker:  ``[BIN] Starting binary stream: N samples (4 channels per sample)``
+    2. Payload:            ``num_samples × 16`` bytes — 4 × little-endian uint32 per sample
+       - Ch1, Ch2: ambient
+       - Ch3, Ch4: PPG signal (IN3 paired)
+    3. Text end marker:    ``[BIN] Stream complete: N samples … sent``
 
     Parameters
     ----------
@@ -215,7 +226,7 @@ def receive_binary_stream(
 
     Returns
     -------
-    StreamResult with ``.samples`` as a list of uint32 values.
+    StreamResult with ``.samples`` as a list of (ch1, ch2, ch3, ch4) tuples.
     """
     if not SERIAL_AVAILABLE:
         return StreamResult(error="pyserial not installed")
@@ -227,7 +238,7 @@ def receive_binary_stream(
         ser.reset_input_buffer()
 
         # Send the streaming command
-        cmd = f"adpd stream-bin {num_samples}\r\n"
+        cmd = f"adpd ppg stream-bin {num_samples}\r\n"
         ser.write(cmd.encode())
         ser.flush()
         result.log.append(f">> {cmd.strip()}")
@@ -248,8 +259,8 @@ def receive_binary_stream(
             result.error = "Start marker not received — is the device connected and running?"
             return result
 
-        # Read the binary payload
-        total_bytes = num_samples * 4
+        # Read the binary payload: num_samples × 16 bytes
+        total_bytes = num_samples * BYTES_PER_SAMPLE
         buf = bytearray()
         while len(buf) < total_bytes and time.monotonic() < deadline:
             remaining = total_bytes - len(buf)
@@ -257,15 +268,19 @@ def receive_binary_stream(
             if chunk:
                 buf.extend(chunk)
                 if progress_cb:
-                    progress_cb(len(buf) // 4, num_samples)
+                    progress_cb(len(buf) // BYTES_PER_SAMPLE, num_samples)
 
         if len(buf) < total_bytes:
             result.log.append(f"Timeout: got {len(buf)}/{total_bytes} bytes")
 
-        # Parse uint32 values
-        parsed = len(buf) // 4
-        result.samples = list(struct.unpack(f"<{parsed}I", bytes(buf[:parsed * 4])))
-        result.log.append(f"Parsed {parsed} samples")
+        # Parse: each 16-byte group → (ch1, ch2, ch3, ch4)
+        parsed = len(buf) // BYTES_PER_SAMPLE
+        raw = struct.unpack(f"<{parsed * 4}I", bytes(buf[:parsed * BYTES_PER_SAMPLE]))
+        result.samples = [
+            (raw[i * 4], raw[i * 4 + 1], raw[i * 4 + 2], raw[i * 4 + 3])
+            for i in range(parsed)
+        ]
+        result.log.append(f"Parsed {parsed} samples ({parsed * BYTES_PER_SAMPLE} bytes)")
 
         # Read trailing end marker (best-effort)
         end_deadline = time.monotonic() + 2.0
