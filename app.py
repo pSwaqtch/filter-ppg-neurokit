@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 import neurokit2 as nk
 import io
 import os
+import time
 
 from ppg_processing import (
     CLEAN_METHODS, PEAK_METHODS, QUALITY_METHODS, TIMESTAMP_COL, QUALITY_REFS,
@@ -28,7 +29,8 @@ from ppg_charts import (
 )
 from usb_serial import (
     SERIAL_AVAILABLE, list_serial_ports, describe_ports,
-    test_connection, send_command, receive_binary_stream,
+    find_port_owner, force_release_port, test_connection,
+    send_command, receive_binary_stream,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -682,13 +684,16 @@ with _tab_serial:
                     st.session_state["serial_connected"]   = True
                     st.session_state["serial_active_port"] = _port
                     st.session_state["serial_active_baud"] = _baud
+                    st.session_state.pop("serial_last_error", None)
                     _conn_log(f"Connected — {_port} @ {_baud} baud", "ok")
                 else:
+                    st.session_state["serial_last_error"] = _chk.error or ""
                     _conn_log(f"Connect failed: {_chk.error}", "error")
                 st.rerun()
         else:
             if st.button("Disconnect", type="secondary", width="stretch", key="serial_disconnect_btn"):
                 st.session_state["serial_connected"] = False
+                st.session_state.pop("serial_last_error", None)
                 _conn_log(f"Disconnected from {_active_port}", "info")
                 st.rerun()
 
@@ -699,6 +704,8 @@ with _tab_serial:
 
     # ── Status badge ──────────────────────────────────────────────────────────
 
+    _last_error = st.session_state.get("serial_last_error", "")
+
     if _is_connected:
         _port_descs = {p["device"]: p["description"] for p in describe_ports()}
         _desc = _port_descs.get(_active_port, _active_port)
@@ -708,7 +715,45 @@ with _tab_serial:
             _port_descs = {p["device"]: p["description"] for p in describe_ports()}
             if _port in _port_descs:
                 st.caption(f"Device: {_port_descs[_port]}")
-        st.warning("Not connected")
+
+        if _last_error and "PORT_BUSY" in _last_error:
+            # Show owner info + force-release option
+            _owner = find_port_owner(_port)
+            _owner_str = f"held by **{_owner[1]}** (PID {_owner[0]})" if _owner else "owner unknown"
+            st.error(f"Port busy — {_owner_str}")
+            _fc1, _fc2 = st.columns([3, 1])
+            with _fc1:
+                st.caption(
+                    "Another process has the port open. "
+                    "Force-disconnect will terminate that process and reconnect."
+                )
+            with _fc2:
+                if st.button("Force Disconnect & Connect", type="primary",
+                             width="stretch", key="serial_force_btn"):
+                    with st.spinner("Releasing port…"):
+                        _rel = force_release_port(_port)
+                    if _rel.ok:
+                        _conn_log(f"Force release: {_rel.response}", "warn")
+                        # Small pause to let OS free the port, then reconnect
+                        time.sleep(0.5)
+                        _chk2 = test_connection(_port, _baud)
+                        if _chk2.ok:
+                            st.session_state["serial_connected"]   = True
+                            st.session_state["serial_active_port"] = _port
+                            st.session_state["serial_active_baud"] = _baud
+                            st.session_state.pop("serial_last_error", None)
+                            _conn_log(f"Connected after force release — {_port} @ {_baud} baud", "ok")
+                        else:
+                            st.session_state["serial_last_error"] = _chk2.error or ""
+                            _conn_log(f"Connect after force release failed: {_chk2.error}", "error")
+                    else:
+                        _conn_log(f"Force release failed: {_rel.error}", "error")
+                        st.session_state["serial_last_error"] = f"FORCE_FAILED: {_rel.error}"
+                    st.rerun()
+        elif _last_error:
+            st.error(_last_error)
+        else:
+            st.warning("Not connected")
 
     # ── Connection log ────────────────────────────────────────────────────────
 

@@ -111,6 +111,72 @@ def _read_line(ser: "serial.Serial", timeout_s: float = 2.0) -> str:
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
+def find_port_owner(port: str) -> Optional[tuple[int, str]]:
+    """Return ``(pid, process_name)`` of the process holding *port* open, or None.
+
+    Uses ``lsof`` (macOS/Linux). Returns None if nothing found or lsof unavailable.
+    """
+    import subprocess
+    try:
+        out = subprocess.check_output(
+            ["lsof", "-t", port], stderr=subprocess.DEVNULL, text=True
+        ).strip()
+        if not out:
+            return None
+        pid = int(out.splitlines()[0])
+        # Get process name
+        name_out = subprocess.check_output(
+            ["ps", "-p", str(pid), "-o", "comm="], stderr=subprocess.DEVNULL, text=True
+        ).strip()
+        return pid, name_out or "unknown"
+    except Exception:
+        return None
+
+
+def force_release_port(port: str) -> CommandResult:
+    """Kill the process holding *port* open so it can be reconnected.
+
+    Finds the owning PID via ``lsof``, sends SIGTERM (then SIGKILL if needed),
+    waits up to 2 s for the port to free, then returns success or error.
+    """
+    import subprocess
+    import signal as _signal
+
+    owner = find_port_owner(port)
+    if owner is None:
+        # No owner found — port may already be free; attempt connect anyway
+        return CommandResult(command="force_release",
+                             response="No owning process found — port may already be free")
+
+    pid, name = owner
+    try:
+        import os
+        os.kill(pid, _signal.SIGTERM)
+        # Give it up to 1 s to die gracefully, then SIGKILL
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)   # check still alive
+                time.sleep(0.05)
+            except ProcessLookupError:
+                break
+        else:
+            os.kill(pid, _signal.SIGKILL)
+            time.sleep(0.2)
+
+        return CommandResult(
+            command="force_release",
+            response=f"Terminated {name} (PID {pid}) — port {port} should be free",
+        )
+    except PermissionError:
+        return CommandResult(
+            command="force_release",
+            error=f"Permission denied killing PID {pid} ({name}) — try running with sudo",
+        )
+    except Exception as exc:
+        return CommandResult(command="force_release", error=str(exc))
+
+
 def test_connection(port: str, baud: int, timeout: float = 2.0) -> CommandResult:
     """Open the port, confirm it is not busy, then close it immediately.
 
@@ -128,7 +194,7 @@ def test_connection(port: str, baud: int, timeout: float = 2.0) -> CommandResult
         msg = str(exc)
         # Classify common failure modes for clearer UI feedback
         if "busy" in msg.lower() or "resource" in msg.lower():
-            return CommandResult(command="connect", error=f"Port busy — another process may have {port} open")
+            return CommandResult(command="connect", error=f"PORT_BUSY: another process has {port} open")
         if "no such file" in msg.lower() or "could not open" in msg.lower():
             return CommandResult(command="connect", error=f"Port not found: {port}")
         if "permission" in msg.lower():
