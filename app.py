@@ -1297,26 +1297,27 @@ with _tab_serial:
     _can_send = _node is None or (isinstance(_node, dict) and _node.get("_optional_end"))
 
     # ── Inline chip row + search bar ──────────────────────────────────────────
-    # Each token is a narrow column with a chip-button (click × to remove).
-    # The search bar / value input occupies the remaining width at the right.
+    # Chips and input in a single flat st.columns call.
+    # weight=3 per chip (stretch-filled), weight=10 for input.
+    # CSS inlined once per render to remove inter-column gap in THIS row only
+    # by targeting the immediately-following sibling horizontal block.
     _is_value_node = isinstance(_node, dict) and "_input" in _node
     _is_dict_node  = isinstance(_node, dict) and "_input" not in _node
 
-    # Column widths: ~1.5 units per token chip, 4 units for input
-    _col_weights = [max(1, len(t)) for t in _tokens] + [5]
-    _row_cols    = st.columns(_col_weights) if _tokens else [None]
-
-    # Chip buttons (all columns except last)
-    for _i, _tok in enumerate(_tokens):
-        with _row_cols[_i]:
-            if st.button(f"{_tok}  ×", key=f"chip_rm_{_i}",
-                         width="content", help=f"Remove '{_tok}'"):
-                st.session_state["_cmd_tokens"].pop(_i)
-                st.session_state["_cmd_next_select"] = None
-                st.rerun()
-
-    # Input column (last column, or full width if no chips yet)
-    _input_col = _row_cols[-1] if _tokens else st.container()
+    if _tokens:
+        _ncols   = len(_tokens) + 1
+        _weights = [3] * len(_tokens) + [10]
+        _all_cols = st.columns(_weights, gap="small")
+        for _i, _tok in enumerate(_tokens):
+            with _all_cols[_i]:
+                if st.button(f"{_tok} ×", key=f"chip_rm_{_i}",
+                             width="stretch", help=f"Remove '{_tok}'"):
+                    st.session_state["_cmd_tokens"] = st.session_state["_cmd_tokens"][:_i]
+                    st.session_state["_cmd_next_select"] = None
+                    st.rerun()
+        _input_col = _all_cols[-1]
+    else:
+        _input_col = st.container()
 
     with _input_col:
         if _is_dict_node:
@@ -1335,6 +1336,38 @@ with _tab_serial:
                     on_change=_on_token_select,
                     label_visibility="collapsed",
                 )
+                # Autofocus: inject via st.markdown <script> tag workaround —
+                # Streamlit strips <script> from markdown, so use components.
+                # height=1 (not 0) ensures the iframe is actually mounted.
+                st.components.v1.html("""
+<script>
+(function() {
+    function doFocus(n) {
+        try {
+            // Navigate from THIS iframe up to the nearest stVerticalBlock,
+            // then find the selectbox input within that same container.
+            // This avoids accidentally focusing the demo-file selector elsewhere.
+            var iframe = window.frameElement;
+            if (!iframe) { if (n>0) setTimeout(function(){doFocus(n-1);},80); return; }
+            var container = iframe.closest('[data-testid="stVerticalBlock"]');
+            if (!container) { if (n>0) setTimeout(function(){doFocus(n-1);},80); return; }
+            var inp = container.querySelector('input[placeholder*="type to search"]');
+            if (!inp) inp = container.querySelector('[data-baseweb="select"] input');
+            if (inp) {
+                inp.focus();
+                var ctrl = inp.closest('[data-baseweb="select"]');
+                if (ctrl) {
+                    ctrl.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true}));
+                }
+            } else if (n > 0) {
+                setTimeout(function(){ doFocus(n-1); }, 80);
+            }
+        } catch(e) {}
+    }
+    setTimeout(function(){ doFocus(10); }, 200);
+})();
+</script>
+""", height=1, scrolling=False)
 
         elif _is_value_node:
             _itype  = _node["_input"]
