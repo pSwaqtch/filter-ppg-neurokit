@@ -241,8 +241,12 @@ def run_pipeline(
     # ── Step 4: HRV Analysis ─────────────────────────────────────────────────
     analysis = None
     try:
-        analysis = nk.ppg_analyze(signals_df, sampling_rate=sampling_rate,
-                                   method="interval-related")
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="DFA_alpha2", category=RuntimeWarning)
+            warnings.filterwarnings("ignore", message="DFA_alpha2")
+            analysis = nk.ppg_analyze(signals_df, sampling_rate=sampling_rate,
+                                       method="interval-related")
     except Exception:
         # Full HRV analysis needs long recordings; compute basic RR stats instead
         peak_idx = np.where(signals_df["PPG_Peaks"].values == 1)[0]

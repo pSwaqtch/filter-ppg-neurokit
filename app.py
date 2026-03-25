@@ -887,21 +887,20 @@ with _tab_serial:
         _conn_log("Stream stopped by user", "warn")
 
     if _capture_btn and not _is_streaming:
-        # Initialise shared mutable containers the thread writes into
-        _stop_ev  = _threading.Event()
-        _buf:      list  = []
-        _raw_buf:  bytearray = bytearray()
-        _log_buf:  list  = []
+        # All shared state lives in a plain dict — thread never touches st.session_state
+        _stop_ev = _threading.Event()
+        _shared: dict = {
+            "buf":      [],
+            "raw":      bytearray(),
+            "log":      [],
+            "error":    None,
+            "done":     False,
+        }
 
-        st.session_state.update({
-            "serial_streaming":  True,
-            "serial_stop_event": _stop_ev,
-            "_sbuf":             _buf,
-            "_sraw":             _raw_buf,
-            "_slog":             _log_buf,
-            "_serror":           None,
-            "_sdone":            False,
-        })
+        st.session_state["serial_streaming"]  = True
+        st.session_state["serial_stop_event"] = _stop_ev
+        st.session_state["_sshared"]          = _shared
+        st.session_state["_sfinalised"]       = False
 
         _capture_port    = _active_port
         _capture_baud    = _active_baud
@@ -916,19 +915,18 @@ with _tab_serial:
                 ):
                     if _stop_ev.is_set():
                         break
-                    _buf.extend(new_s)
-                    _raw_buf.extend(new_raw)
-                    _log_buf.extend(new_log)
+                    _shared["buf"].extend(new_s)
+                    _shared["raw"].extend(new_raw)
+                    _shared["log"].extend(new_log)
                     for ll in new_log:
                         if ll.startswith("ERROR:"):
-                            st.session_state["_serror"] = ll[6:].strip()
+                            _shared["error"] = ll[6:].strip()
                             _stop_ev.set()
                             break
             except Exception as exc:
-                st.session_state["_serror"] = str(exc)
+                _shared["error"] = str(exc)
             finally:
-                st.session_state["serial_streaming"] = False
-                st.session_state["_sdone"] = True
+                _shared["done"] = True   # fragment detects this and flips serial_streaming
 
         _t = _threading.Thread(target=_stream_worker, daemon=True)
         _t.start()
@@ -945,21 +943,28 @@ with _tab_serial:
     def _stream_display_fragment():
         import plotly.graph_objects as _go
 
+        _shared     = st.session_state.get("_sshared", {})
         _streaming  = st.session_state.get("serial_streaming", False)
-        _done       = st.session_state.get("_sdone", False)
-        _error      = st.session_state.get("_serror")
-        _buf        = st.session_state.get("_sbuf", [])
-        _raw_buf    = st.session_state.get("_sraw", bytearray())
-        _log_buf    = st.session_state.get("_slog", [])
+        _buf        = _shared.get("buf", [])
+        _raw_buf    = _shared.get("raw", bytearray())
+        _log_buf    = _shared.get("log", [])
+        _error      = _shared.get("error")
+        _done       = _shared.get("done", False)
+
+        # Fragment is the only place that flips serial_streaming off.
+        # _sfinalised guards against running the finalise block twice.
+        if _done and _streaming:
+            st.session_state["serial_streaming"] = False
+            _streaming = False
 
         # ── Progress bar while active ─────────────────────────────────────────
         if _streaming or (_done and _buf):
             _requested = st.session_state.get("serial_n_samples", 1)
             _pct = min(int(len(_buf) / max(_requested, 1) * 100), 100)
+            _stopped = _error or st.session_state.get("serial_stop_event", _threading.Event()).is_set()
             _label = (f"Receiving… {len(_buf)}/{_requested} samples"
                       if _streaming else
-                      f"{'Stopped' if _error or st.session_state.get('serial_stop_event', _threading.Event()).is_set() else 'Complete'}"
-                      f" — {len(_buf)} samples")
+                      f"{'Stopped' if _stopped else 'Complete'} — {len(_buf)} samples")
             st.progress(_pct, text=_label)
 
         # ── Error banner ──────────────────────────────────────────────────────
@@ -1039,13 +1044,19 @@ with _tab_serial:
                 )
 
         # ── Finalise to persistent keys once done so clear/reload works ───────
-        if _done and _buf and not _streaming:
+        if _done and _buf and not _streaming and not st.session_state.get("_sfinalised"):
             st.session_state["serial_last_samples"]   = list(_buf)
             st.session_state["serial_last_raw_bytes"] = bytes(_raw_buf)
             st.session_state["serial_last_log"]       = list(_log_buf)
-            if not _error:
-                _conn_log(f"Stream complete: {len(_buf)} samples captured", "ok")
-            # Trigger outer rerun to reset run_every to None (stop auto-refresh)
+            _msg = f"Stream complete: {len(_buf)} samples"
+            if _error:
+                _conn_log(f"Stream ended with error: {_error}", "error")
+            elif st.session_state.get("serial_stop_event", _threading.Event()).is_set():
+                _conn_log(f"Stream stopped by user: {len(_buf)} samples kept", "warn")
+            else:
+                _conn_log(_msg, "ok")
+            st.session_state["_sfinalised"] = True
+            # Outer rerun resets run_every → None (stops auto-refresh)
             st.rerun()
 
         # ── Stream log ────────────────────────────────────────────────────────
@@ -1062,7 +1073,7 @@ with _tab_serial:
     _log       = st.session_state.get("serial_last_log", [])
 
     # Only show static display when NOT actively streaming
-    if _samples and not _is_streaming and not st.session_state.get("_sdone"):
+    if _samples and not _is_streaming and not st.session_state.get("_sshared", {}).get("done"):
         import plotly.graph_objects as _go_s
         _ts_ms_s = [s[0] for s in _samples]
         _ch_arrays_s = {
@@ -1115,14 +1126,14 @@ with _tab_serial:
                                key="dl_serial_bin_s", width="stretch",
                                help=f"{len(_raw_bytes):,} bytes — 20 bytes/sample")
 
-    if _log and not _is_streaming and not st.session_state.get("_sdone"):
+    if _log and not _is_streaming and not st.session_state.get("_sshared", {}).get("done"):
         with st.expander("Stream log"):
             st.code("\n".join(_log), language="text")
 
-    if _samples and not _is_streaming and not st.session_state.get("_sdone"):
+    if _samples and not _is_streaming and not st.session_state.get("_sshared", {}).get("done"):
         if st.button("Clear Captured Data", key="serial_clear"):
             for _k in ("serial_last_samples", "serial_last_raw_bytes", "serial_last_log",
-                       "_sbuf", "_sraw", "_slog", "_serror", "_sdone"):
+                       "_sshared", "_sfinalised"):
                 st.session_state.pop(_k, None)
             st.rerun()
 
