@@ -882,207 +882,267 @@ with _tab_serial:
         _live_mode = st.toggle("Live graph", value=True, key="serial_live_mode",
                                help="Update chart as data arrives instead of waiting for all samples")
 
-    _capture_btn = st.button("Capture Stream", type="primary", width="stretch",
-                             key="serial_capture_btn")
+    # ── Start / Stop buttons ──────────────────────────────────────────────────
 
-    if _capture_btn:
-        _conn_log(f"Stream start: {int(_n_samples)} samples from {_active_port} "
+    import threading as _threading
+
+    _is_streaming = st.session_state.get("serial_streaming", False)
+
+    _btn_col1, _btn_col2 = st.columns([3, 1])
+    with _btn_col1:
+        _capture_btn = st.button(
+            "Capture Stream", type="primary", width="stretch",
+            key="serial_capture_btn", disabled=_is_streaming,
+        )
+    with _btn_col2:
+        _stop_btn = st.button(
+            "Stop", type="secondary", width="stretch",
+            key="serial_stop_btn", disabled=not _is_streaming,
+        )
+
+    if _stop_btn and _is_streaming:
+        st.session_state.get("serial_stop_event", _threading.Event()).set()
+        _conn_log("Stream stopped by user", "warn")
+
+    if _capture_btn and not _is_streaming:
+        # Initialise shared mutable containers the thread writes into
+        _stop_ev  = _threading.Event()
+        _buf:      list  = []
+        _raw_buf:  bytearray = bytearray()
+        _log_buf:  list  = []
+
+        st.session_state.update({
+            "serial_streaming":  True,
+            "serial_stop_event": _stop_ev,
+            "_sbuf":             _buf,
+            "_sraw":             _raw_buf,
+            "_slog":             _log_buf,
+            "_serror":           None,
+            "_sdone":            False,
+        })
+
+        _capture_port    = _active_port
+        _capture_baud    = _active_baud
+        _capture_n       = int(_n_samples)
+        _capture_timeout = float(_stream_timeout)
+
+        def _stream_worker():
+            try:
+                for new_s, new_raw, new_log, _ in stream_binary_live(
+                    _capture_port, _capture_baud, _capture_n,
+                    stream_timeout_s=_capture_timeout,
+                ):
+                    if _stop_ev.is_set():
+                        break
+                    _buf.extend(new_s)
+                    _raw_buf.extend(new_raw)
+                    _log_buf.extend(new_log)
+                    for ll in new_log:
+                        if ll.startswith("ERROR:"):
+                            st.session_state["_serror"] = ll[6:].strip()
+                            _stop_ev.set()
+                            break
+            except Exception as exc:
+                st.session_state["_serror"] = str(exc)
+            finally:
+                st.session_state["serial_streaming"] = False
+                st.session_state["_sdone"] = True
+
+        _t = _threading.Thread(target=_stream_worker, daemon=True)
+        _t.start()
+        _conn_log(f"Stream start: {_capture_n} samples from {_capture_port} "
                   f"({'live' if _live_mode else 'batch'})", "info")
+        st.rerun()
 
-        if _live_mode:
-            # ── Live mode: update chart incrementally ─────────────────────────
-            import plotly.graph_objects as _go2
+    # ── Live / batch display fragment ─────────────────────────────────────────
+    # run_every drives auto-refresh while streaming; None = render once
 
-            _live_samples: list = []
-            _live_raw = bytearray()
-            _live_log: list[str] = []
-            _live_error: str = ""
+    _refresh_rate = 0.5 if _is_streaming and _live_mode else None
 
-            _prog  = st.progress(0, text="Waiting for start marker…")
-            _chart = st.empty()
-            _status_ph = st.empty()
+    @st.fragment(run_every=_refresh_rate)
+    def _stream_display_fragment():
+        import plotly.graph_objects as _go
 
+        _streaming  = st.session_state.get("serial_streaming", False)
+        _done       = st.session_state.get("_sdone", False)
+        _error      = st.session_state.get("_serror")
+        _buf        = st.session_state.get("_sbuf", [])
+        _raw_buf    = st.session_state.get("_sraw", bytearray())
+        _log_buf    = st.session_state.get("_slog", [])
+
+        # ── Progress bar while active ─────────────────────────────────────────
+        if _streaming or (_done and _buf):
+            _requested = st.session_state.get("serial_n_samples", 1)
+            _pct = min(int(len(_buf) / max(_requested, 1) * 100), 100)
+            _label = (f"Receiving… {len(_buf)}/{_requested} samples"
+                      if _streaming else
+                      f"{'Stopped' if _error or st.session_state.get('serial_stop_event', _threading.Event()).is_set() else 'Complete'}"
+                      f" — {len(_buf)} samples")
+            st.progress(_pct, text=_label)
+
+        # ── Error banner ──────────────────────────────────────────────────────
+        if _error:
+            st.error(f"Stream error: {_error}")
+
+        # ── Chart — show live during streaming, or final result ───────────────
+        _show_chart = _buf and (_streaming or _done)
+        if _show_chart:
             _CH_COLORS  = {"Ch1 (ambient)": "#aaa", "Ch2 (ambient)": "#888",
                            "Ch3 (PPG)": "#1f77b4", "Ch4 (PPG)": "#ff7f0e"}
             _CH_VISIBLE = {"Ch1 (ambient)": "legendonly", "Ch2 (ambient)": "legendonly",
                            "Ch3 (PPG)": True, "Ch4 (PPG)": True}
 
-            def _build_live_fig(samples):
-                fig = _go2.Figure()
-                ts   = [s[0] for s in samples]
-                vals = {
-                    "Ch1 (ambient)": [s[1] for s in samples],
-                    "Ch2 (ambient)": [s[2] for s in samples],
-                    "Ch3 (PPG)":     [s[3] for s in samples],
-                    "Ch4 (PPG)":     [s[4] for s in samples],
-                }
-                for name, ys in vals.items():
-                    fig.add_trace(_go2.Scatter(
-                        x=ts, y=ys, mode="lines", name=name,
-                        line=dict(color=_CH_COLORS[name], width=1),
-                        visible=_CH_VISIBLE[name],
-                    ))
-                fig.update_layout(
-                    xaxis_title="Time (ms from stream start)",
-                    yaxis_title="ADC value (uint32)",
-                    margin=dict(l=0, r=0, t=30, b=0),
-                    height=380,
-                    legend=dict(orientation="h", y=1.05),
-                    uirevision="live",   # keeps zoom/pan stable across updates
+            _ts_ms = [s[0] for s in _buf]
+            _ch_arrays = {
+                "Ch1 (ambient)": [s[1] for s in _buf],
+                "Ch2 (ambient)": [s[2] for s in _buf],
+                "Ch3 (PPG)":     [s[3] for s in _buf],
+                "Ch4 (PPG)":     [s[4] for s in _buf],
+            }
+            _fig = _go.Figure()
+            for _ch_name, _ch_vals in _ch_arrays.items():
+                _fig.add_trace(_go.Scatter(
+                    x=_ts_ms, y=_ch_vals, mode="lines", name=_ch_name,
+                    line=dict(color=_CH_COLORS[_ch_name], width=1),
+                    visible=_CH_VISIBLE[_ch_name],
+                ))
+            _fig.update_layout(
+                xaxis_title="Time (ms from stream start)",
+                yaxis_title="ADC value (uint32)",
+                margin=dict(l=0, r=0, t=30, b=0),
+                height=380,
+                legend=dict(orientation="h", y=1.05),
+                uirevision="stream",   # stable zoom/pan across redraws
+            )
+            st.plotly_chart(_fig, use_container_width=True)
+            st.caption("Ch3/Ch4 = PPG (IN3 paired)  |  Ch1/Ch2 = ambient  |  toggle in legend")
+
+        # ── Metrics + export — available as soon as there is ANY data ─────────
+        if _buf:
+            _ch3 = [s[3] for s in _buf]
+            _ts_ms_b = [s[0] for s in _buf]
+            _dur = (_ts_ms_b[-1] - _ts_ms_b[0]) / 1000 if len(_ts_ms_b) > 1 else 0
+
+            _mc1, _mc2, _mc3, _mc4, _mc5 = st.columns(5)
+            _mc1.metric("Samples",  len(_buf))
+            _mc2.metric("Duration", f"{_dur:.2f} s")
+            _mc3.metric("Ch3 mean", f"{int(sum(_ch3) / len(_ch3)):,}")
+            _mc4.metric("Ch3 min",  f"{min(_ch3):,}")
+            _mc5.metric("Ch3 max",  f"{max(_ch3):,}")
+
+            _serial_df = pd.DataFrame({
+                "timestamp_ms": _ts_ms_b,
+                "ch1_ambient":  [s[1] for s in _buf],
+                "ch2_ambient":  [s[2] for s in _buf],
+                "ch3_ppg":      _ch3,
+                "ch4_ppg":      [s[4] for s in _buf],
+            })
+            _raw_bytes_dl = bytes(_raw_buf)
+
+            _dl1, _dl2 = st.columns(2)
+            with _dl1:
+                st.download_button(
+                    "Export Parsed CSV",
+                    _serial_df.to_csv(index=False).encode(),
+                    "serial_capture.csv", "text/csv",
+                    key="dl_serial_csv", width="stretch",
                 )
-                return fig
-
-            for _new_s, _new_raw, _new_log, _is_final in stream_binary_live(
-                _active_port, _active_baud, int(_n_samples),
-                stream_timeout_s=_stream_timeout,
-            ):
-                _live_samples.extend(_new_s)
-                _live_raw.extend(_new_raw)
-                _live_log.extend(_new_log)
-
-                # Detect errors in log lines
-                for _ll in _new_log:
-                    if _ll.startswith("ERROR:"):
-                        _live_error = _ll[6:].strip()
-
-                if _live_error:
-                    break
-
-                # Update progress
-                pct = min(int(len(_live_samples) / _n_samples * 100), 100)
-                _prog.progress(pct, text=f"Receiving… {len(_live_samples)}/{int(_n_samples)} samples")
-
-                # Redraw chart whenever we have data
-                if _live_samples:
-                    _chart.plotly_chart(_build_live_fig(_live_samples),
-                                        use_container_width=True, key=None)
-
-            _prog.empty()
-
-            if _live_error:
-                _conn_log(f"Stream error: {_live_error}", "error")
-                _status_ph.error(f"Stream error: {_live_error}")
-            elif _live_samples:
-                _conn_log(f"Stream complete: {len(_live_samples)} samples captured", "ok")
-                _status_ph.success(f"Captured {len(_live_samples)} samples")
-                st.session_state["serial_last_samples"]   = _live_samples
-                st.session_state["serial_last_raw_bytes"] = bytes(_live_raw)
-                st.session_state["serial_last_log"]       = _live_log
-            else:
-                _conn_log("Stream: no samples received", "warn")
-                _status_ph.warning("No samples received.")
-
-        else:
-            # ── Batch mode: wait for all, then show ───────────────────────────
-            _progress_bar = st.progress(0, text="Waiting for start marker…")
-
-            def _update_progress(received: int, total: int):
-                pct = min(int(received / total * 100), 100)
-                _progress_bar.progress(pct, text=f"Receiving… {received}/{total} samples")
-
-            with st.spinner("Streaming…"):
-                _stream = receive_binary_stream(
-                    _active_port, _active_baud, int(_n_samples),
-                    stream_timeout_s=_stream_timeout,
-                    progress_cb=_update_progress,
+            with _dl2:
+                st.download_button(
+                    "Export Raw Binary (.bin)",
+                    _raw_bytes_dl,
+                    "serial_capture.bin", "application/octet-stream",
+                    key="dl_serial_bin", width="stretch",
+                    help=f"{len(_raw_bytes_dl):,} bytes — 20 bytes/sample (timestamp_ms + ch1-4 uint32 LE)",
                 )
 
-            _progress_bar.empty()
+        # ── Finalise to persistent keys once done so clear/reload works ───────
+        if _done and _buf and not _streaming:
+            st.session_state["serial_last_samples"]   = list(_buf)
+            st.session_state["serial_last_raw_bytes"] = bytes(_raw_buf)
+            st.session_state["serial_last_log"]       = list(_log_buf)
+            if not _error:
+                _conn_log(f"Stream complete: {len(_buf)} samples captured", "ok")
+            # Trigger outer rerun to reset run_every to None (stop auto-refresh)
+            st.rerun()
 
-            if _stream.ok and _stream.count > 0:
-                _conn_log(f"Stream complete: {_stream.count} samples captured", "ok")
-                st.session_state["serial_last_samples"]   = _stream.samples
-                st.session_state["serial_last_raw_bytes"] = _stream.raw_bytes
-                st.session_state["serial_last_log"]       = _stream.log
-            elif not _stream.ok:
-                _conn_log(f"Stream error: {_stream.error}", "error")
-                st.error(f"Stream error: {_stream.error}")
-            else:
-                _conn_log("Stream: no samples received", "warn")
-                st.warning("No samples received.")
-                if _stream.log:
-                    st.code("\n".join(_stream.log), language="text")
+        # ── Stream log ────────────────────────────────────────────────────────
+        if _log_buf:
+            with st.expander("Stream log"):
+                st.code("\n".join(_log_buf), language="text")
 
-    # ── Display captured data ─────────────────────────────────────────────────
+    _stream_display_fragment()
+
+    # ── Previously captured data (after fragment, for persistent display) ─────
 
     _samples   = st.session_state.get("serial_last_samples", [])
     _raw_bytes = st.session_state.get("serial_last_raw_bytes", b"")
     _log       = st.session_state.get("serial_last_log", [])
 
-    if _samples:
-        import plotly.graph_objects as _go
-
-        # _samples is list of (timestamp_ms, ch1, ch2, ch3, ch4) tuples
-        _ts_ms       = [s[0] for s in _samples]
-        _ch_arrays = {
+    # Only show static display when NOT actively streaming
+    if _samples and not _is_streaming and not st.session_state.get("_sdone"):
+        import plotly.graph_objects as _go_s
+        _ts_ms_s = [s[0] for s in _samples]
+        _ch_arrays_s = {
             "Ch1 (ambient)": [s[1] for s in _samples],
             "Ch2 (ambient)": [s[2] for s in _samples],
             "Ch3 (PPG)":     [s[3] for s in _samples],
             "Ch4 (PPG)":     [s[4] for s in _samples],
         }
-        _ch_colors  = {"Ch1 (ambient)": "#aaa", "Ch2 (ambient)": "#888",
-                       "Ch3 (PPG)": "#1f77b4", "Ch4 (PPG)": "#ff7f0e"}
-        _ch_visible = {"Ch1 (ambient)": "legendonly", "Ch2 (ambient)": "legendonly",
-                       "Ch3 (PPG)": True, "Ch4 (PPG)": True}
-
-        _fig_serial = _go.Figure()
-        for _ch_name, _ch_vals in _ch_arrays.items():
-            _fig_serial.add_trace(_go.Scatter(
-                x=_ts_ms, y=_ch_vals, mode="lines", name=_ch_name,
-                line=dict(color=_ch_colors[_ch_name], width=1),
-                visible=_ch_visible[_ch_name],
+        _fig_s = _go_s.Figure()
+        for _cn, _cv in _ch_arrays_s.items():
+            _fig_s.add_trace(_go_s.Scatter(
+                x=_ts_ms_s, y=_cv, mode="lines", name=_cn,
+                line=dict(color={"Ch1 (ambient)":"#aaa","Ch2 (ambient)":"#888",
+                                 "Ch3 (PPG)":"#1f77b4","Ch4 (PPG)":"#ff7f0e"}[_cn], width=1),
+                visible={"Ch1 (ambient)":"legendonly","Ch2 (ambient)":"legendonly",
+                         "Ch3 (PPG)":True,"Ch4 (PPG)":True}[_cn],
             ))
-        _duration_serial = (_ts_ms[-1] - _ts_ms[0]) / 1000 if len(_ts_ms) > 1 else 0
-        _fig_serial.update_layout(
-            xaxis_title="Time (ms from stream start)",
-            yaxis_title="ADC value (uint32)",
-            margin=dict(l=0, r=0, t=30, b=0),
-            height=380,
+        _dur_s = (_ts_ms_s[-1] - _ts_ms_s[0]) / 1000 if len(_ts_ms_s) > 1 else 0
+        _fig_s.update_layout(
+            xaxis_title="Time (ms from stream start)", yaxis_title="ADC value (uint32)",
+            margin=dict(l=0, r=0, t=30, b=0), height=380,
             legend=dict(orientation="h", y=1.05),
         )
-        st.plotly_chart(_fig_serial, width="stretch", key="chart_serial_raw")
-        st.caption("Ch3/Ch4 = PPG (IN3 paired)  |  Ch1/Ch2 = ambient  |  toggle channels in legend")
+        st.plotly_chart(_fig_s, width="stretch", key="chart_serial_static")
+        st.caption("Ch3/Ch4 = PPG (IN3 paired)  |  Ch1/Ch2 = ambient  |  toggle in legend")
 
-        _s_col1, _s_col2, _s_col3, _s_col4, _s_col5 = st.columns(5)
-        _s_col1.metric("Samples",       len(_samples))
-        _s_col2.metric("Duration",      f"{_duration_serial:.2f} s")
-        _s_col3.metric("Ch3 mean",      f"{int(sum(_ch_arrays['Ch3 (PPG)']) / len(_samples)):,}")
-        _s_col4.metric("Ch3 min",       f"{min(_ch_arrays['Ch3 (PPG)']):,}")
-        _s_col5.metric("Ch3 max",       f"{max(_ch_arrays['Ch3 (PPG)']):,}")
+        _ch3_s = _ch_arrays_s["Ch3 (PPG)"]
+        _sc1, _sc2, _sc3, _sc4, _sc5 = st.columns(5)
+        _sc1.metric("Samples",  len(_samples))
+        _sc2.metric("Duration", f"{_dur_s:.2f} s")
+        _sc3.metric("Ch3 mean", f"{int(sum(_ch3_s)/len(_ch3_s)):,}")
+        _sc4.metric("Ch3 min",  f"{min(_ch3_s):,}")
+        _sc5.metric("Ch3 max",  f"{max(_ch3_s):,}")
 
-        _serial_df = pd.DataFrame({
-            "timestamp_ms": _ts_ms,
-            "ch1_ambient":  _ch_arrays["Ch1 (ambient)"],
-            "ch2_ambient":  _ch_arrays["Ch2 (ambient)"],
-            "ch3_ppg":      _ch_arrays["Ch3 (PPG)"],
-            "ch4_ppg":      _ch_arrays["Ch4 (PPG)"],
+        _sdf = pd.DataFrame({
+            "timestamp_ms": _ts_ms_s,
+            "ch1_ambient":  _ch_arrays_s["Ch1 (ambient)"],
+            "ch2_ambient":  _ch_arrays_s["Ch2 (ambient)"],
+            "ch3_ppg":      _ch3_s,
+            "ch4_ppg":      _ch_arrays_s["Ch4 (PPG)"],
         })
-        _dl1, _dl2 = st.columns(2)
-        with _dl1:
-            st.download_button(
-                "Export Parsed CSV",
-                _serial_df.to_csv(index=False).encode(),
-                "serial_capture.csv", "text/csv",
-                key="dl_serial_csv", width="stretch",
-            )
-        with _dl2:
-            st.download_button(
-                "Export Raw Binary (.bin)",
-                _raw_bytes,
-                "serial_capture.bin", "application/octet-stream",
-                key="dl_serial_bin", width="stretch",
-                help=f"{len(_raw_bytes):,} bytes — verbatim payload, 20 bytes/sample (timestamp_ms + ch1-4 uint32 LE)",
-            )
+        _dl1s, _dl2s = st.columns(2)
+        with _dl1s:
+            st.download_button("Export Parsed CSV", _sdf.to_csv(index=False).encode(),
+                               "serial_capture.csv", "text/csv",
+                               key="dl_serial_csv_s", width="stretch")
+        with _dl2s:
+            st.download_button("Export Raw Binary (.bin)", _raw_bytes,
+                               "serial_capture.bin", "application/octet-stream",
+                               key="dl_serial_bin_s", width="stretch",
+                               help=f"{len(_raw_bytes):,} bytes — 20 bytes/sample")
 
-    if _log:
+    if _log and not _is_streaming and not st.session_state.get("_sdone"):
         with st.expander("Stream log"):
             st.code("\n".join(_log), language="text")
 
-    if _samples and st.button("Clear Captured Data", key="serial_clear"):
-        st.session_state.pop("serial_last_samples", None)
-        st.session_state.pop("serial_last_raw_bytes", None)
-        st.session_state.pop("serial_last_log", None)
-        st.rerun()
+    if _samples and not _is_streaming and not st.session_state.get("_sdone"):
+        if st.button("Clear Captured Data", key="serial_clear"):
+            for _k in ("serial_last_samples", "serial_last_raw_bytes", "serial_last_log",
+                       "_sbuf", "_sraw", "_slog", "_serror", "_sdone"):
+                st.session_state.pop(_k, None)
+            st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sidebar: all-in-one export (Analysis tab only)
