@@ -28,7 +28,7 @@ from ppg_charts import (
 )
 from usb_serial import (
     SERIAL_AVAILABLE, list_serial_ports, describe_ports,
-    send_command, receive_binary_stream,
+    test_connection, send_command, receive_binary_stream,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -638,30 +638,102 @@ with _tab_serial:
         st.error("`pyserial` is not installed. Run: `pip install pyserial`")
         st.stop()
 
-    # ── Connection settings ───────────────────────────────────────────────────
+    # ── Session-state helpers ─────────────────────────────────────────────────
+
+    def _conn_log(msg: str, level: str = "info"):
+        """Append a timestamped entry to the persistent connection log."""
+        import datetime
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        st.session_state.setdefault("serial_conn_log", []).append(
+            (ts, level, msg)
+        )
+
+    _is_connected   = st.session_state.get("serial_connected", False)
+    _active_port    = st.session_state.get("serial_active_port", "")
+    _active_baud    = st.session_state.get("serial_active_baud", 115200)
+
+    # ── Port / baud pickers (disabled when connected) ─────────────────────────
 
     _ports = list_serial_ports()
-    _sc1, _sc2, _sc3 = st.columns([3, 2, 1])
+    _sc1, _sc2, _sc3, _sc4 = st.columns([3, 2, 1, 1])
 
     with _sc1:
         if _ports:
-            _port = st.selectbox("Serial Port", _ports, key="serial_port")
+            _default_idx = _ports.index(_active_port) if _active_port in _ports else 0
+            _port = st.selectbox("Serial Port", _ports, index=_default_idx,
+                                 key="serial_port", disabled=_is_connected)
         else:
-            _port = st.text_input("Serial Port (manual)", value="/dev/tty.usbmodem101",
-                                  key="serial_port_manual")
+            _port = st.text_input("Serial Port (manual)",
+                                  value=_active_port or "/dev/tty.usbmodem101",
+                                  key="serial_port_manual", disabled=_is_connected)
+
     with _sc2:
-        _baud = st.selectbox("Baud Rate", [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600],
-                             index=4, key="serial_baud")
+        _baud_opts = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
+        _baud_idx  = _baud_opts.index(_active_baud) if _active_baud in _baud_opts else 4
+        _baud = st.selectbox("Baud Rate", _baud_opts, index=_baud_idx,
+                             key="serial_baud", disabled=_is_connected)
+
     with _sc3:
-        if st.button("Refresh Ports", width="stretch"):
+        if not _is_connected:
+            if st.button("Connect", type="primary", width="stretch", key="serial_connect_btn"):
+                with st.spinner(f"Connecting to {_port}…"):
+                    _chk = test_connection(_port, _baud)
+                if _chk.ok:
+                    st.session_state["serial_connected"]   = True
+                    st.session_state["serial_active_port"] = _port
+                    st.session_state["serial_active_baud"] = _baud
+                    _conn_log(f"Connected — {_port} @ {_baud} baud", "ok")
+                else:
+                    _conn_log(f"Connect failed: {_chk.error}", "error")
+                st.rerun()
+        else:
+            if st.button("Disconnect", type="secondary", width="stretch", key="serial_disconnect_btn"):
+                st.session_state["serial_connected"] = False
+                _conn_log(f"Disconnected from {_active_port}", "info")
+                st.rerun()
+
+    with _sc4:
+        if st.button("Refresh", width="stretch", key="serial_refresh_btn",
+                     disabled=_is_connected):
             st.rerun()
 
-    if _ports:
+    # ── Status badge ──────────────────────────────────────────────────────────
+
+    if _is_connected:
         _port_descs = {p["device"]: p["description"] for p in describe_ports()}
-        if _port in _port_descs:
-            st.caption(f"Device: {_port_descs[_port]}")
+        _desc = _port_descs.get(_active_port, _active_port)
+        st.success(f"Connected — **{_active_port}** @ {_active_baud} baud  |  {_desc}")
+    else:
+        if _ports:
+            _port_descs = {p["device"]: p["description"] for p in describe_ports()}
+            if _port in _port_descs:
+                st.caption(f"Device: {_port_descs[_port]}")
+        st.warning("Not connected")
+
+    # ── Connection log ────────────────────────────────────────────────────────
+
+    _conn_entries = st.session_state.get("serial_conn_log", [])
+    with st.expander(f"Connection log ({len(_conn_entries)} entries)", expanded=bool(_conn_entries)):
+        if _conn_entries:
+            _level_icons = {"ok": "✓", "error": "✗", "warn": "!", "info": "·"}
+            _log_lines = [
+                f"[{ts}]  {_level_icons.get(lvl, '·')}  {msg}"
+                for ts, lvl, msg in reversed(_conn_entries)
+            ]
+            st.code("\n".join(_log_lines), language="text")
+            if st.button("Clear log", key="serial_clear_log"):
+                st.session_state["serial_conn_log"] = []
+                st.rerun()
+        else:
+            st.caption("No events yet.")
 
     st.divider()
+
+    # ── Guard: require connection for commands / stream ───────────────────────
+
+    if not _is_connected:
+        st.info("Connect to a device above to send commands or capture a stream.")
+        st.stop()
 
     # ── Command console ───────────────────────────────────────────────────────
 
@@ -671,7 +743,7 @@ with _tab_serial:
     _cmd_col1, _cmd_col2 = st.columns([5, 1])
     with _cmd_col1:
         _cmd_input = st.text_input(
-            "Command", value="adpd stream-bin 100", key="serial_cmd_input",
+            "Command", key="serial_cmd_input",
             label_visibility="collapsed", placeholder="Enter command…",
         )
     with _cmd_col2:
@@ -682,18 +754,22 @@ with _tab_serial:
 
     if _send_clicked and _cmd_input.strip():
         with st.spinner(f"Sending: `{_cmd_input.strip()}`…"):
-            _result = send_command(_port, _baud, _cmd_input.strip(),
+            _result = send_command(_active_port, _active_baud, _cmd_input.strip(),
                                    response_timeout_s=_resp_timeout)
         if _result.ok:
+            _conn_log(f">> {_cmd_input.strip()}", "info")
+            if _result.response:
+                _conn_log(f"<< {_result.response[:120]}", "info")
             st.success("Command sent")
             if _result.response:
                 st.code(_result.response, language="text")
             else:
                 st.info("No response received within timeout.")
         else:
+            _conn_log(f"Command error: {_result.error}", "error")
             st.error(f"Error: {_result.error}")
 
-    # Command history quick-pick
+    # Command quick-pick
     with st.expander("Common Commands"):
         _common_cmds = [
             "adpd stream-bin 100",
@@ -734,9 +810,10 @@ with _tab_serial:
             pct = min(int(received / total * 100), 100)
             _progress_bar.progress(pct, text=f"Receiving… {received}/{total} samples")
 
+        _conn_log(f"Stream start: {int(_n_samples)} samples from {_active_port}", "info")
         with st.spinner("Streaming…"):
             _stream = receive_binary_stream(
-                _port, _baud, int(_n_samples),
+                _active_port, _active_baud, int(_n_samples),
                 stream_timeout_s=_stream_timeout,
                 progress_cb=_update_progress,
             )
@@ -744,15 +821,14 @@ with _tab_serial:
         _progress_bar.empty()
 
         if _stream.ok and _stream.count > 0:
-            st.success(f"Captured {_stream.count} samples")
-
-            # Store in session state so it persists across reruns
+            _conn_log(f"Stream complete: {_stream.count} samples captured", "ok")
             st.session_state["serial_last_samples"] = _stream.samples
             st.session_state["serial_last_log"]     = _stream.log
-
         elif not _stream.ok:
+            _conn_log(f"Stream error: {_stream.error}", "error")
             st.error(f"Stream error: {_stream.error}")
         else:
+            _conn_log("Stream: no samples received", "warn")
             st.warning("No samples received.")
             if _stream.log:
                 st.code("\n".join(_stream.log), language="text")
@@ -785,7 +861,6 @@ with _tab_serial:
         _s_col3.metric("Max",      f"{max(_samples):,}")
         _s_col4.metric("Mean",     f"{int(sum(_samples) / len(_samples)):,}")
 
-        # Export captured data as CSV
         _serial_df = pd.DataFrame({
             "sample_index": range(len(_samples)),
             "adc_raw": _samples,
@@ -800,8 +875,6 @@ with _tab_serial:
     if _log:
         with st.expander("Stream log"):
             st.code("\n".join(_log), language="text")
-
-    # ── Clear ─────────────────────────────────────────────────────────────────
 
     if _samples and st.button("Clear Captured Data", key="serial_clear"):
         st.session_state.pop("serial_last_samples", None)

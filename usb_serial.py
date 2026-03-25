@@ -105,6 +105,33 @@ def _read_line(ser: "serial.Serial", timeout_s: float = 2.0) -> str:
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
+def test_connection(port: str, baud: int, timeout: float = 2.0) -> CommandResult:
+    """Open the port, confirm it is not busy, then close it immediately.
+
+    Returns a :class:`CommandResult` with ``error=None`` on success, or an
+    error message describing why the connection failed (port busy, not found,
+    permission denied, etc.).
+    """
+    if not SERIAL_AVAILABLE:
+        return CommandResult(command="connect", error="pyserial not installed")
+    try:
+        ser = _open(port, baud, timeout=timeout)
+        ser.close()
+        return CommandResult(command="connect", response=f"OK — {port} @ {baud} baud")
+    except serial.SerialException as exc:
+        msg = str(exc)
+        # Classify common failure modes for clearer UI feedback
+        if "busy" in msg.lower() or "resource" in msg.lower():
+            return CommandResult(command="connect", error=f"Port busy — another process may have {port} open")
+        if "no such file" in msg.lower() or "could not open" in msg.lower():
+            return CommandResult(command="connect", error=f"Port not found: {port}")
+        if "permission" in msg.lower():
+            return CommandResult(command="connect", error=f"Permission denied on {port} — check user/group access")
+        return CommandResult(command="connect", error=msg)
+    except Exception as exc:
+        return CommandResult(command="connect", error=f"Unexpected error: {exc}")
+
+
 def send_command(
     port: str,
     baud: int,
