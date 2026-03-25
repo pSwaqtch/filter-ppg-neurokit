@@ -791,7 +791,11 @@ with _tab_serial:
     # ── Binary stream capture ─────────────────────────────────────────────────
 
     st.subheader("Binary Stream Capture")
-    st.caption("Sends `adpd stream-bin N` and parses the 4-byte little-endian uint32 payload.")
+    st.caption(
+        "Sends `adpd ppg stream-bin N` — device starts PPG, streams N × 16 bytes "
+        "(4 × uint32 little-endian per sample), then stops PPG.  "
+        "Ch3/Ch4 = PPG (IN3 paired), Ch1/Ch2 = ambient."
+    )
 
     _bs1, _bs2 = st.columns(2)
     with _bs1:
