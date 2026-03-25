@@ -30,7 +30,7 @@ from ppg_charts import (
 from usb_serial import (
     SERIAL_AVAILABLE, list_serial_ports, describe_ports,
     find_port_owner, force_release_port, test_connection,
-    send_command, receive_binary_stream,
+    send_command, receive_binary_stream, stream_binary_live,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -871,47 +871,137 @@ with _tab_serial:
         "Ch3/Ch4 = PPG (IN3 paired), Ch1/Ch2 = ambient."
     )
 
-    _bs1, _bs2 = st.columns(2)
+    _bs1, _bs2, _bs3 = st.columns([2, 2, 1])
     with _bs1:
         _n_samples = st.number_input("Samples to capture", min_value=10, max_value=100000,
                                      value=500, step=50, key="serial_n_samples")
     with _bs2:
         _stream_timeout = st.number_input("Stream timeout (s)", min_value=5.0, max_value=120.0,
                                           value=30.0, step=5.0, key="serial_stream_timeout")
+    with _bs3:
+        _live_mode = st.toggle("Live graph", value=True, key="serial_live_mode",
+                               help="Update chart as data arrives instead of waiting for all samples")
 
     _capture_btn = st.button("Capture Stream", type="primary", width="stretch",
                              key="serial_capture_btn")
 
     if _capture_btn:
-        _progress_bar = st.progress(0, text="Waiting for start marker…")
+        _conn_log(f"Stream start: {int(_n_samples)} samples from {_active_port} "
+                  f"({'live' if _live_mode else 'batch'})", "info")
 
-        def _update_progress(received: int, total: int):
-            pct = min(int(received / total * 100), 100)
-            _progress_bar.progress(pct, text=f"Receiving… {received}/{total} samples")
+        if _live_mode:
+            # ── Live mode: update chart incrementally ─────────────────────────
+            import plotly.graph_objects as _go2
 
-        _conn_log(f"Stream start: {int(_n_samples)} samples from {_active_port}", "info")
-        with st.spinner("Streaming…"):
-            _stream = receive_binary_stream(
+            _live_samples: list = []
+            _live_raw = bytearray()
+            _live_log: list[str] = []
+            _live_error: str = ""
+
+            _prog  = st.progress(0, text="Waiting for start marker…")
+            _chart = st.empty()
+            _status_ph = st.empty()
+
+            _CH_COLORS  = {"Ch1 (ambient)": "#aaa", "Ch2 (ambient)": "#888",
+                           "Ch3 (PPG)": "#1f77b4", "Ch4 (PPG)": "#ff7f0e"}
+            _CH_VISIBLE = {"Ch1 (ambient)": "legendonly", "Ch2 (ambient)": "legendonly",
+                           "Ch3 (PPG)": True, "Ch4 (PPG)": True}
+
+            def _build_live_fig(samples):
+                fig = _go2.Figure()
+                ts   = [s[0] for s in samples]
+                vals = {
+                    "Ch1 (ambient)": [s[1] for s in samples],
+                    "Ch2 (ambient)": [s[2] for s in samples],
+                    "Ch3 (PPG)":     [s[3] for s in samples],
+                    "Ch4 (PPG)":     [s[4] for s in samples],
+                }
+                for name, ys in vals.items():
+                    fig.add_trace(_go2.Scatter(
+                        x=ts, y=ys, mode="lines", name=name,
+                        line=dict(color=_CH_COLORS[name], width=1),
+                        visible=_CH_VISIBLE[name],
+                    ))
+                fig.update_layout(
+                    xaxis_title="Time (ms from stream start)",
+                    yaxis_title="ADC value (uint32)",
+                    margin=dict(l=0, r=0, t=30, b=0),
+                    height=380,
+                    legend=dict(orientation="h", y=1.05),
+                    uirevision="live",   # keeps zoom/pan stable across updates
+                )
+                return fig
+
+            for _new_s, _new_raw, _new_log, _is_final in stream_binary_live(
                 _active_port, _active_baud, int(_n_samples),
                 stream_timeout_s=_stream_timeout,
-                progress_cb=_update_progress,
-            )
+            ):
+                _live_samples.extend(_new_s)
+                _live_raw.extend(_new_raw)
+                _live_log.extend(_new_log)
 
-        _progress_bar.empty()
+                # Detect errors in log lines
+                for _ll in _new_log:
+                    if _ll.startswith("ERROR:"):
+                        _live_error = _ll[6:].strip()
 
-        if _stream.ok and _stream.count > 0:
-            _conn_log(f"Stream complete: {_stream.count} samples captured", "ok")
-            st.session_state["serial_last_samples"]   = _stream.samples
-            st.session_state["serial_last_raw_bytes"] = _stream.raw_bytes
-            st.session_state["serial_last_log"]       = _stream.log
-        elif not _stream.ok:
-            _conn_log(f"Stream error: {_stream.error}", "error")
-            st.error(f"Stream error: {_stream.error}")
+                if _live_error:
+                    break
+
+                # Update progress
+                pct = min(int(len(_live_samples) / _n_samples * 100), 100)
+                _prog.progress(pct, text=f"Receiving… {len(_live_samples)}/{int(_n_samples)} samples")
+
+                # Redraw chart whenever we have data
+                if _live_samples:
+                    _chart.plotly_chart(_build_live_fig(_live_samples),
+                                        use_container_width=True, key=None)
+
+            _prog.empty()
+
+            if _live_error:
+                _conn_log(f"Stream error: {_live_error}", "error")
+                _status_ph.error(f"Stream error: {_live_error}")
+            elif _live_samples:
+                _conn_log(f"Stream complete: {len(_live_samples)} samples captured", "ok")
+                _status_ph.success(f"Captured {len(_live_samples)} samples")
+                st.session_state["serial_last_samples"]   = _live_samples
+                st.session_state["serial_last_raw_bytes"] = bytes(_live_raw)
+                st.session_state["serial_last_log"]       = _live_log
+            else:
+                _conn_log("Stream: no samples received", "warn")
+                _status_ph.warning("No samples received.")
+
         else:
-            _conn_log("Stream: no samples received", "warn")
-            st.warning("No samples received.")
-            if _stream.log:
-                st.code("\n".join(_stream.log), language="text")
+            # ── Batch mode: wait for all, then show ───────────────────────────
+            _progress_bar = st.progress(0, text="Waiting for start marker…")
+
+            def _update_progress(received: int, total: int):
+                pct = min(int(received / total * 100), 100)
+                _progress_bar.progress(pct, text=f"Receiving… {received}/{total} samples")
+
+            with st.spinner("Streaming…"):
+                _stream = receive_binary_stream(
+                    _active_port, _active_baud, int(_n_samples),
+                    stream_timeout_s=_stream_timeout,
+                    progress_cb=_update_progress,
+                )
+
+            _progress_bar.empty()
+
+            if _stream.ok and _stream.count > 0:
+                _conn_log(f"Stream complete: {_stream.count} samples captured", "ok")
+                st.session_state["serial_last_samples"]   = _stream.samples
+                st.session_state["serial_last_raw_bytes"] = _stream.raw_bytes
+                st.session_state["serial_last_log"]       = _stream.log
+            elif not _stream.ok:
+                _conn_log(f"Stream error: {_stream.error}", "error")
+                st.error(f"Stream error: {_stream.error}")
+            else:
+                _conn_log("Stream: no samples received", "warn")
+                st.warning("No samples received.")
+                if _stream.log:
+                    st.code("\n".join(_stream.log), language="text")
 
     # ── Display captured data ─────────────────────────────────────────────────
 

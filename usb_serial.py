@@ -261,6 +261,7 @@ def send_command(
 
 BYTES_PER_SAMPLE = 20   # 4-byte timestamp + 4 channels × 4 bytes
 CHANNELS = ("timestamp_ms", "ch1", "ch2", "ch3", "ch4")
+LIVE_CHUNK_BYTES = 200  # ~10 samples per UI update at 20 bytes/sample
 
 
 def receive_binary_stream(
@@ -370,3 +371,108 @@ def receive_binary_stream(
         result.error = f"Unexpected error: {exc}"
 
     return result
+
+
+def stream_binary_live(
+    port: str,
+    baud: int,
+    num_samples: int,
+    chunk_bytes: int = LIVE_CHUNK_BYTES,
+    stream_timeout_s: float = 30.0,
+):
+    """Generator: yields parsed sample chunks as they arrive for live display.
+
+    Each yield is ``(new_samples, new_raw_bytes, new_log_lines, is_final)``:
+    - ``new_samples``:   list of ``(timestamp_ms, ch1, ch2, ch3, ch4)`` tuples
+    - ``new_raw_bytes``: verbatim bytes for those samples
+    - ``new_log_lines``: protocol log lines since the last yield
+    - ``is_final``:      True on the last yield (done or error)
+
+    Log lines starting with ``ERROR:`` indicate a failure.
+    """
+    if not SERIAL_AVAILABLE:
+        yield [], b"", ["ERROR: pyserial not installed"], True
+        return
+
+    log: list[str] = []
+
+    try:
+        ser = _open(port, baud, timeout=stream_timeout_s)
+        ser.reset_input_buffer()
+
+        cmd = f"adpd ppg stream-bin {num_samples}\r\n"
+        ser.write(cmd.encode())
+        ser.flush()
+        log.append(f">> {cmd.strip()}")
+
+        # Wait for start marker
+        deadline = time.monotonic() + stream_timeout_s
+        start_seen = False
+        while time.monotonic() < deadline:
+            line = _read_line(ser, timeout_s=1.0)
+            if line:
+                log.append(f"<< {line}")
+            if "[BIN] Starting binary stream" in line:
+                start_seen = True
+                break
+
+        if not start_seen:
+            ser.close()
+            yield [], b"", log + ["ERROR: Start marker not received — is the device connected?"], True
+            return
+
+        # First yield: just the start-marker log, no samples yet
+        yield [], b"", log, False
+        log = []
+
+        total_bytes = num_samples * BYTES_PER_SAMPLE
+        received_bytes = 0
+        pending = bytearray()
+
+        while received_bytes < total_bytes and time.monotonic() < deadline:
+            want = min(chunk_bytes, total_bytes - received_bytes)
+            chunk = ser.read(want)
+            if not chunk:
+                continue
+
+            pending.extend(chunk)
+            received_bytes += len(chunk)
+
+            # Only emit complete samples
+            complete = (len(pending) // BYTES_PER_SAMPLE) * BYTES_PER_SAMPLE
+            if complete == 0:
+                continue
+
+            raw_chunk = bytes(pending[:complete])
+            pending = pending[complete:]
+
+            n = complete // BYTES_PER_SAMPLE
+            raw_vals = struct.unpack(f"<{n * 5}I", raw_chunk)
+            new_samples = [
+                (raw_vals[i * 5], raw_vals[i * 5 + 1],
+                 raw_vals[i * 5 + 2], raw_vals[i * 5 + 3], raw_vals[i * 5 + 4])
+                for i in range(n)
+            ]
+            is_done = received_bytes >= total_bytes
+            yield new_samples, raw_chunk, [], is_done
+
+        if received_bytes < total_bytes:
+            log.append(f"Timeout: got {received_bytes}/{total_bytes} bytes")
+
+        # Read trailing end marker (best-effort)
+        end_deadline = time.monotonic() + 2.0
+        while time.monotonic() < end_deadline:
+            line = _read_line(ser, timeout_s=0.5)
+            if line:
+                log.append(f"<< {line}")
+            if "[BIN] Stream complete" in line:
+                break
+
+        ser.close()
+        if log:
+            yield [], b"", log, True
+
+    except serial.SerialException as exc:
+        yield [], b"", [f"ERROR: {exc}"], True
+    except Exception as exc:
+        yield [], b"", [f"ERROR: Unexpected: {exc}"], True
