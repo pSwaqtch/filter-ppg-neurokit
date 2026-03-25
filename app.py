@@ -9,6 +9,7 @@ Requires Python 3.10+  (neurokit2 ≥0.2.10 uses float | None, PEP 604).
 import matplotlib
 matplotlib.use("Agg")
 
+import threading
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -45,6 +46,7 @@ DEMO_FILES = [
     "trial_data_4.csv",
     "trial_data_5.xlsx",
 ]
+_LIVE_DISPLAY_S = 15.0   # rolling display window for streaming mode
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data loading helpers (Streamlit IO — not portable to C)
@@ -190,8 +192,13 @@ _tab_analysis, _tab_serial = st.tabs(["Analysis", "USB Serial"])
 
 with st.sidebar:
     st.header("Data Source")
-    data_source_mode = st.radio("Source", ["Demo files", "Upload file"], label_visibility="collapsed")
+    data_source_mode = st.radio(
+        "Source",
+        ["Demo files", "Upload file", "USB Serial Stream"],
+        label_visibility="collapsed",
+    )
 
+    _live_stream_mode = data_source_mode == "USB Serial Stream"
     df_raw = None
     file_ext = ".csv"
 
@@ -200,7 +207,8 @@ with st.sidebar:
         file_path = os.path.join(DATA_DIR, chosen_file)
         file_ext = os.path.splitext(chosen_file)[1].lower()
         df_raw = load_data(file_path, file_ext)
-    else:
+
+    elif data_source_mode == "Upload file":
         uploaded = st.file_uploader("Upload CSV or XLSX", type=["csv", "xlsx", "xls"])
         if uploaded is not None:
             file_ext = os.path.splitext(uploaded.name)[1].lower()
@@ -209,24 +217,137 @@ with st.sidebar:
             st.info("Upload a file to continue.")
             st.stop()
 
-    ts_col = find_timestamp_col(df_raw)
+    else:  # USB Serial Stream
+        if not SERIAL_AVAILABLE:
+            st.error("`pyserial` not installed — `pip install pyserial`")
+            st.stop()
 
-    signal_cols = get_signal_columns(df_raw)
-    if not signal_cols:
-        st.warning("No valid signal columns found (all numeric non-timestamp columns are >80% NaN).")
-        st.stop()
+        _live_ports = list_serial_ports()
+        _live_is_streaming = st.session_state.get("live_streaming", False)
 
-    signal_col = st.selectbox("Channel", signal_cols)
+        if _live_ports:
+            _live_port_default = st.session_state.get("live_port", _live_ports[0])
+            _live_port_idx = _live_ports.index(_live_port_default) if _live_port_default in _live_ports else 0
+            live_port = st.selectbox("Serial Port", _live_ports, index=_live_port_idx,
+                                     key="live_port", disabled=_live_is_streaming)
+        else:
+            live_port = st.text_input("Serial Port (manual)", "/dev/tty.usbmodem101",
+                                      key="live_port_manual", disabled=_live_is_streaming)
 
-    # Reset timeline whenever file or channel changes
-    _source_key = (
-        chosen_file if data_source_mode == "Demo files" else getattr(uploaded, "name", ""),
-        signal_col,
-    )
-    if st.session_state.get("_source_key") != _source_key:
-        st.session_state.pop("analysis_window", None)
-        st.session_state.pop("_pending_window", None)
-        st.session_state["_source_key"] = _source_key
+        _baud_opts_live = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
+        _live_baud_default = st.session_state.get("live_baud", 115200)
+        _live_baud_idx = _baud_opts_live.index(_live_baud_default) if _live_baud_default in _baud_opts_live else 4
+        live_baud = st.selectbox("Baud Rate", _baud_opts_live, index=_live_baud_idx,
+                                  key="live_baud", disabled=_live_is_streaming)
+
+        live_channel = st.selectbox(
+            "PPG Channel", ["ch1", "ch2", "ch3", "ch4"], index=2, key="live_channel",
+            help="Ch3/Ch4 = PPG (IN3 paired), Ch1/Ch2 = ambient",
+            disabled=_live_is_streaming,
+        )
+        live_n_samples = int(st.number_input(
+            "Samples to request", min_value=100, max_value=100_000,
+            value=10_000, step=500, key="live_n_samples",
+            help="Large value = continuous stream; hit Stop to end early",
+            disabled=_live_is_streaming,
+        ))
+        live_analysis_window_s = int(st.slider(
+            "Analysis window (s)", min_value=3, max_value=10, value=5,
+            key="live_analysis_window_s",
+            help=f"Seconds of data fed to NeuroKit2 pipeline (display shows last {int(_LIVE_DISPLAY_S)} s)",
+        ))
+
+        # ── Start / Stop ──────────────────────────────────────────────────
+        _lc1, _lc2 = st.columns(2)
+        with _lc1:
+            if st.button("▶ Start", disabled=_live_is_streaming, type="primary",
+                         width="stretch", key="live_start_btn"):
+                _live_stop_ev = threading.Event()
+                _live_shared: dict = {
+                    "buf":   [],
+                    "raw":   bytearray(),
+                    "log":   [],
+                    "error": None,
+                    "done":  False,
+                }
+                st.session_state["live_streaming"]   = True
+                st.session_state["live_stop_event"]  = _live_stop_ev
+                st.session_state["_sshared_live"]    = _live_shared
+                st.session_state["_live_finalised"]  = False
+                st.session_state.pop("_live_computed_sr", None)
+
+                _lport   = live_port
+                _lbaud   = live_baud
+                _lnsampl = live_n_samples
+
+                def _live_worker():
+                    try:
+                        for new_s, new_raw, new_log, is_final in stream_binary_live(
+                            _lport, _lbaud, _lnsampl,
+                        ):
+                            if _live_stop_ev.is_set():
+                                break
+                            _live_shared["buf"].extend(new_s)
+                            _live_shared["raw"].extend(new_raw)
+                            _live_shared["log"].extend(new_log)
+                            for ll in new_log:
+                                if ll.startswith("ERROR:"):
+                                    _live_shared["error"] = ll[6:].strip()
+                                    _live_stop_ev.set()
+                                    break
+                            if is_final or _live_stop_ev.is_set():
+                                break
+                    except Exception as exc:
+                        _live_shared["error"] = str(exc)
+                    finally:
+                        _live_shared["done"] = True
+
+                t = threading.Thread(target=_live_worker, daemon=True)
+                t.start()
+                st.rerun()
+
+        with _lc2:
+            if st.button("■ Stop", disabled=not _live_is_streaming,
+                         width="stretch", key="live_stop_btn"):
+                ev = st.session_state.get("live_stop_event")
+                if ev:
+                    ev.set()
+
+        # ── Stream status ─────────────────────────────────────────────────
+        _lshared_disp = st.session_state.get("_sshared_live", {})
+        _lbuf_disp    = _lshared_disp.get("buf", [])
+        _lerr_disp    = _lshared_disp.get("error")
+        if _live_is_streaming:
+            st.info(f"Streaming — {len(_lbuf_disp):,} samples received")
+        elif _lerr_disp:
+            st.error(f"Stream error: {_lerr_disp}")
+        elif _lbuf_disp:
+            st.success(f"Done — {len(_lbuf_disp):,} samples")
+        else:
+            st.caption("Press ▶ Start to begin streaming.")
+
+    # ── Signal column (file modes only) ───────────────────────────────────────
+
+    if not _live_stream_mode:
+        ts_col = find_timestamp_col(df_raw)
+        signal_cols = get_signal_columns(df_raw)
+        if not signal_cols:
+            st.warning("No valid signal columns found (all numeric non-timestamp columns are >80% NaN).")
+            st.stop()
+        signal_col = st.selectbox("Channel", signal_cols)
+
+        # Reset timeline whenever file or channel changes
+        _source_key = (
+            chosen_file if data_source_mode == "Demo files" else getattr(uploaded, "name", ""),
+            signal_col,
+        )
+        if st.session_state.get("_source_key") != _source_key:
+            st.session_state.pop("analysis_window", None)
+            st.session_state.pop("_pending_window", None)
+            st.session_state["_source_key"] = _source_key
+    else:
+        signal_col = st.session_state.get("live_channel", "ch3")
+        ts_col     = "timestamp_ms"
 
     # ── Signal Transform ──────────────────────────────────────────────────────
     signal_transform = st.radio(
@@ -237,7 +358,7 @@ with st.sidebar:
     invert_signal = signal_transform == "Invert (2^x − raw)"
     flip_ac       = signal_transform == "Flip AC (2×mean − signal)"
 
-    adc_bits = 24
+    adc_bits         = 24
     flip_ac_sliding  = True
     flip_ac_window_s = 2.0
 
@@ -259,29 +380,46 @@ with st.sidebar:
     st.divider()
     st.subheader("Sample Rate")
 
-    timestamps_ms, signal, detected_sr = cached_prepare_signal(df_raw, signal_col, ts_col)
+    if not _live_stream_mode:
+        timestamps_ms, signal, detected_sr = cached_prepare_signal(df_raw, signal_col, ts_col)
+        st.metric("Detected", f"{detected_sr:.1f} Hz")
+        override_sr = st.toggle("Override SR")
+        if override_sr:
+            sampling_rate = st.number_input("Manual SR (Hz)", min_value=1.0, max_value=10000.0,
+                                            value=float(round(detected_sr, 1)), step=0.5)
+        else:
+            sampling_rate = detected_sr
 
-    st.metric("Detected", f"{detected_sr:.1f} Hz")
-    override_sr = st.toggle("Override SR")
-    if override_sr:
-        sampling_rate = st.number_input("Manual SR (Hz)", min_value=1.0, max_value=10000.0,
-                                        value=float(round(detected_sr, 1)), step=0.5)
+        _t0 = float(timestamps_ms[0])
+        _t1 = float(timestamps_ms[-1])
+        _duration_s = (_t1 - _t0) / 1000
+
+        if st.button("Reset Timeline", width="stretch"):
+            st.session_state._pending_window = (_t0, _t1)
+            st.rerun()
     else:
-        sampling_rate = detected_sr
-
-    _t0 = float(timestamps_ms[0])
-    _t1 = float(timestamps_ms[-1])
-    _duration_s = (_t1 - _t0) / 1000
-
-    if st.button("Reset Timeline", width="stretch"):
-        st.session_state._pending_window = (_t0, _t1)
-        st.rerun()
+        # Live SR: computed inside fragment, stored in session state
+        _live_sr_val = st.session_state.get("_live_computed_sr", 0.0)
+        st.metric("Live SR", f"{_live_sr_val:.1f} Hz" if _live_sr_val > 0 else "— Hz")
+        override_sr = st.toggle("Override SR", key="live_override_sr")
+        if override_sr:
+            sampling_rate = st.number_input("Manual SR (Hz)", min_value=1.0, max_value=10000.0,
+                                            value=float(round(_live_sr_val or 100.0, 1)), step=0.5,
+                                            key="live_manual_sr")
+        else:
+            sampling_rate = _live_sr_val if _live_sr_val > 0 else 100.0
+        # dummy _t0/_t1 for streaming (real values computed inside fragment)
+        timestamps_ms = np.array([], dtype=np.float64)
+        signal        = np.array([], dtype=np.float64)
+        _t0 = 0.0
+        _t1 = _LIVE_DISPLAY_S * 1000
 
     st.divider()
     show_nk_plot = st.checkbox("Show NeuroKit2 native plot (matplotlib)")
 
-    if "_pending_window" in st.session_state:
-        st.session_state.analysis_window = st.session_state.pop("_pending_window")
+    if not _live_stream_mode:
+        if "_pending_window" in st.session_state:
+            st.session_state.analysis_window = st.session_state.pop("_pending_window")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -293,63 +431,76 @@ peak_method     = st.session_state.get("peak_method",     PEAK_METHODS[0])
 quality_methods = st.session_state.get("quality_methods", [QUALITY_METHODS[0]])
 if not quality_methods:
     quality_methods = [QUALITY_METHODS[0]]
-quality_method = quality_methods[0]   # used for overview subplot
-
-win_ms = st.session_state.get("analysis_window", (_t0, _t1))
-
-# ── Apply window mask + signal transform ──────────────────────────────────────
-mask = (timestamps_ms >= win_ms[0]) & (timestamps_ms <= win_ms[1])
-timestamps_w  = timestamps_ms[mask]
-signal_w_orig = signal[mask]
+quality_method = quality_methods[0]
 
 transform_mode = "invert" if invert_signal else ("flip_ac" if flip_ac else "none")
-signal_w, _flip_baseline = apply_signal_transform(
-    signal_w_orig,
-    mode=transform_mode,
-    adc_bits=adc_bits,
-    flip_sliding=flip_ac_sliding,
-    flip_window_s=flip_ac_window_s,
-    sampling_rate=sampling_rate,
-)
 _signal_transformed = transform_mode != "none"
 
-# ── Run Pipeline ──────────────────────────────────────────────────────────────
+if not _live_stream_mode:
+    # ── Apply window mask + signal transform ──────────────────────────────────
+    win_ms = st.session_state.get("analysis_window", (_t0, _t1))
 
-if len(signal_w) < 10:
-    st.error("Selected window is too short. Widen the time window in the sidebar.")
-    st.stop()
+    mask = (timestamps_ms >= win_ms[0]) & (timestamps_ms <= win_ms[1])
+    timestamps_w  = timestamps_ms[mask]
+    signal_w_orig = signal[mask]
 
-signal_bytes = signal_w.tobytes()
+    signal_w, _flip_baseline = apply_signal_transform(
+        signal_w_orig,
+        mode=transform_mode,
+        adc_bits=adc_bits,
+        flip_sliding=flip_ac_sliding,
+        flip_window_s=flip_ac_window_s,
+        sampling_rate=sampling_rate,
+    )
 
-try:
-    results = cached_pipeline(signal_bytes, sampling_rate, clean_method, peak_method, quality_method)
-except ValueError as e:
-    st.error(f"Processing error: {e}\n\nTry a different cleaning/peak method or check the signal length.")
-    st.stop()
-except Exception as e:
-    st.error(f"Unexpected error during pipeline: {e}")
-    st.stop()
+    if len(signal_w) < 10:
+        st.error("Selected window is too short. Widen the time window in the sidebar.")
+        st.stop()
 
-cleaned    = results["cleaned"]
-signals_df = results["signals_df"]
-info       = results["info"]
-quality    = results["quality"]
-analysis   = results["analysis"]
+    signal_bytes = signal_w.tobytes()
 
-peak_indices = info.get("PPG_Peaks", np.array([], dtype=int))
+    try:
+        results = cached_pipeline(signal_bytes, sampling_rate, clean_method, peak_method, quality_method)
+    except ValueError as e:
+        st.error(f"Processing error: {e}\n\nTry a different cleaning/peak method or check the signal length.")
+        st.stop()
+    except Exception as e:
+        st.error(f"Unexpected error during pipeline: {e}")
+        st.stop()
 
-# ── Auto beat windows (update on peak change) ────────────────────────────────
-_peaks_fp = (len(peak_indices), int(np.sum(peak_indices)) if len(peak_indices) else 0)
-if st.session_state.get("_peaks_fp") != _peaks_fp:
-    _auto_pre, _auto_post = auto_beat_windows(peak_indices, sampling_rate)
-    st.session_state.beat_pre  = _auto_pre
-    st.session_state.beat_post = _auto_post
-    st.session_state._peaks_fp = _peaks_fp
+    cleaned    = results["cleaned"]
+    signals_df = results["signals_df"]
+    info       = results["info"]
+    quality    = results["quality"]
+    analysis   = results["analysis"]
+
+    peak_indices = info.get("PPG_Peaks", np.array([], dtype=int))
+
+    # ── Auto beat windows (update on peak change) ────────────────────────────
+    _peaks_fp = (len(peak_indices), int(np.sum(peak_indices)) if len(peak_indices) else 0)
+    if st.session_state.get("_peaks_fp") != _peaks_fp:
+        _auto_pre, _auto_post = auto_beat_windows(peak_indices, sampling_rate)
+        st.session_state.beat_pre  = _auto_pre
+        st.session_state.beat_post = _auto_post
+        st.session_state._peaks_fp = _peaks_fp
+    else:
+        st.session_state.setdefault("beat_pre",  0.2)
+        st.session_state.setdefault("beat_post", 0.5)
+
+    hr_mean, hr_min, hr_max = compute_hr_metrics(peak_indices, sampling_rate)
+
 else:
-    st.session_state.setdefault("beat_pre",  0.2)
-    st.session_state.setdefault("beat_post", 0.5)
-
-hr_mean, hr_min, hr_max = compute_hr_metrics(peak_indices, sampling_rate)
+    # Streaming mode: pipeline runs inside the analysis fragment
+    timestamps_w = signal_w = signal_w_orig = np.array([], dtype=np.float64)
+    _flip_baseline = None
+    signal_bytes   = b""
+    cleaned = np.array([], dtype=np.float64)
+    signals_df = pd.DataFrame()
+    info = {"PPG_Peaks": np.array([], dtype=int)}
+    quality = None
+    analysis = None
+    peak_indices = np.array([], dtype=int)
+    hr_mean = hr_min = hr_max = None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Tab 1: Analysis
@@ -392,242 +543,477 @@ with _tab_analysis:
 </div>
 """, unsafe_allow_html=True)
 
-    # ── Time Window slider ────────────────────────────────────────────────────
+    # ── File mode: Time Window slider ─────────────────────────────────────────
 
-    st.subheader("Time Window")
-    wc1, wc2 = st.columns([11, 1])
-    with wc1:
-        win_ms = st.slider(
-            "Analysis window", min_value=_t0, max_value=_t1, value=(_t0, _t1),
-            key="analysis_window", label_visibility="collapsed",
-        )
-    with wc2:
-        if st.button("Reset", width="stretch", key="reset_main"):
-            st.session_state._pending_window = (_t0, _t1)
-            st.rerun()
-
-    win_dur = (win_ms[1] - win_ms[0]) / 1000
-    st.caption(f"{win_dur:.1f} s selected of {_duration_s:.1f} s total — box-select any chart below to zoom")
-
-    mask = (timestamps_ms >= win_ms[0]) & (timestamps_ms <= win_ms[1])
-    timestamps_w = timestamps_ms[mask]
-
-    st.divider()
-
-    # Convenience shortcut used repeatedly below
-    def _ex():
-        return make_export_df(timestamps_w, signal_w, cleaned, signals_df,
-                              signal_col, signal_bytes, sampling_rate,
-                              clean_method, peak_method, quality_methods)
-
-    _c = signal_col.replace("-", "_")
-
-    # ── Section 1: Raw Data ───────────────────────────────────────────────────
-
-    st.markdown('<div class="section-anchor" id="raw-data"></div>', unsafe_allow_html=True)
-    st.header("Raw Data")
-
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Rows",              len(df_raw))
-    col2.metric("Columns",           len(df_raw.columns))
-    col3.metric("Duration (window)", f"{(timestamps_w[-1] - timestamps_w[0]) / 1000:.1f} s")
-    col4.metric("SR",                f"{sampling_rate:.1f} Hz")
-
-    st.caption("Box-select a region to zoom all charts")
-    ev_raw = st.plotly_chart(
-        plot_raw_signal(timestamps_w, signal_w, signal_col,
-                        original=signal_w_orig if _signal_transformed else None,
-                        baseline=_flip_baseline),
-        width="stretch", key="chart_raw", on_select="rerun", selection_mode="box",
-    )
-    _b = _extract_box_x(ev_raw)
-    if _b:
-        st.session_state._pending_window = (max(_t0, min(_b)), min(_t1, max(_b)))
-        st.rerun()
-
-    st.subheader("Signal Statistics")
-    st.dataframe(pd.Series(signal_w, name=signal_col).describe().to_frame().T, width="stretch")
-
-    with st.expander("Data Preview (full file, head 200)"):
-        st.dataframe(df_raw.head(200), width="stretch")
-
-    _dl_button("Export Raw CSV", _ex()[["timestamp_ms", f"{_c}_raw"]], "raw_signal.csv", "dl_raw")
-
-    st.divider()
-
-    # ── Section 2: Processed Signal ───────────────────────────────────────────
-
-    st.markdown('<div class="section-anchor" id="processed-signal"></div>', unsafe_allow_html=True)
-    st.header("Processed Signal")
-
-    _pcol1, _pcol2 = st.columns(2)
-    _pcol1.selectbox("Cleaning Method", CLEAN_METHODS,
-                     index=CLEAN_METHODS.index(clean_method), key="clean_method")
-    _pcol2.selectbox("Peak Detection Method", PEAK_METHODS,
-                     index=PEAK_METHODS.index(peak_method), key="peak_method")
-
-    show_raw_overlay = st.checkbox("Show raw signal", value=False, key="show_raw_overlay")
-    st.caption("Box-select a region to zoom all charts")
-    ev_proc = st.plotly_chart(
-        plot_cleaned_overlay(timestamps_w, signal_w if show_raw_overlay else None, cleaned, signal_col),
-        width="stretch", key="chart_proc", on_select="rerun", selection_mode="box",
-    )
-    _b = _extract_box_x(ev_proc)
-    if _b:
-        st.session_state._pending_window = (max(_t0, min(_b)), min(_t1, max(_b)))
-        st.rerun()
-    st.caption(f"Cleaning method: **{clean_method}** | SR: **{sampling_rate:.1f} Hz**")
-
-    _dl_button("Export Processed CSV",
-               _ex()[["timestamp_ms", f"{_c}_raw", f"{_c}_cleaned"]],
-               "processed_signal.csv", "dl_proc")
-
-    st.divider()
-
-    # ── Section 3: Peak Detection ─────────────────────────────────────────────
-
-    st.markdown('<div class="section-anchor" id="peak-detection"></div>', unsafe_allow_html=True)
-    st.header("Peak Detection")
-
-    st.caption("Box-select a region to zoom all charts")
-    ev_peaks = st.plotly_chart(plot_peaks(timestamps_w, cleaned, peak_indices),
-                               width="stretch", key="chart_peaks",
-                               on_select="rerun", selection_mode="box")
-    _b = _extract_box_x(ev_peaks)
-    if _b:
-        st.session_state._pending_window = (max(_t0, min(_b)), min(_t1, max(_b)))
-        st.rerun()
-
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Peaks Detected", len(peak_indices))
-    if hr_mean is not None:
-        m2.metric("Mean HR", f"{hr_mean:.1f} bpm")
-        m3.metric("Min HR",  f"{hr_min:.1f} bpm")
-        m4.metric("Max HR",  f"{hr_max:.1f} bpm")
-
-    st.caption(f"Peak method: **{peak_method}** | Cleaning: **{clean_method}**")
-
-    _dl_button("Export Peaks CSV",
-               _ex()[["timestamp_ms", f"{_c}_raw", f"{_c}_cleaned", "PPG_Peak", "PPG_Rate_bpm"]],
-               "peak_detection.csv", "dl_peaks")
-
-    if show_nk_plot:
-        with st.expander("NeuroKit2 Native Plot", expanded=True):
-            try:
-                fig_nk = nk.ppg_plot(signals_df, info)
-                st.pyplot(fig_nk)
-                plt.close(fig_nk)
-            except Exception as e:
-                st.warning(f"Could not render NeuroKit2 native plot: {e}")
-
-    st.divider()
-
-    # ── Section 4: Individual Beats ───────────────────────────────────────────
-
-    st.markdown('<div class="section-anchor" id="individual-beats"></div>', unsafe_allow_html=True)
-    st.header("Individual Beats")
-
-    beat_pre  = st.session_state.get("beat_pre",  0.2)
-    beat_post = st.session_state.get("beat_post", 0.5)
-
-    if len(peak_indices) < 2:
-        st.warning("Not enough peaks detected to segment individual beats.")
-    else:
-        try:
-            epochs = cached_epochs(
-                cleaned.tobytes(), peak_indices.astype(np.int64).tobytes(),
-                sampling_rate, -beat_pre, beat_post,
+    if not _live_stream_mode:
+        st.subheader("Time Window")
+        wc1, wc2 = st.columns([11, 1])
+        with wc1:
+            win_ms = st.slider(
+                "Analysis window", min_value=_t0, max_value=_t1, value=(_t0, _t1),
+                key="analysis_window", label_visibility="collapsed",
             )
-            hr_mean_beats, _, _ = compute_hr_metrics(peak_indices, sampling_rate)
-            st.plotly_chart(
-                plot_individual_beats(epochs, hr_mean_beats),
-                width="stretch", key=f"chart_beats_{beat_pre}_{beat_post}",
-            )
-            st.caption(f"{len(epochs)} beats | window: −{beat_pre}s to +{beat_post}s around each peak")
-        except Exception as e:
-            st.error(f"Beat segmentation failed: {e}")
+        with wc2:
+            if st.button("Reset", width="stretch", key="reset_main"):
+                st.session_state._pending_window = (_t0, _t1)
+                st.rerun()
 
-    st.subheader("Beat Segmentation")
-    bc1, bc2 = st.columns(2)
-    with bc1:
-        st.slider("Pre-peak window (s)",  0.1, 0.5, step=0.05, key="beat_pre")
-    with bc2:
-        st.slider("Post-peak window (s)", 0.2, 1.0, step=0.05, key="beat_post")
+        win_dur = (win_ms[1] - win_ms[0]) / 1000
+        st.caption(f"{win_dur:.1f} s selected of {_duration_s:.1f} s total — box-select any chart below to zoom")
 
-    st.divider()
+        mask = (timestamps_ms >= win_ms[0]) & (timestamps_ms <= win_ms[1])
+        timestamps_w = timestamps_ms[mask]
 
-    # ── Section 5: HRV / Analysis ─────────────────────────────────────────────
+        st.divider()
 
-    st.markdown('<div class="section-anchor" id="hrv-analysis"></div>', unsafe_allow_html=True)
-    st.header("HRV / Analysis")
+    # ── Analysis display (fragment for streaming auto-refresh) ────────────────
 
-    if analysis is not None:
-        st.dataframe(analysis, width="stretch")
-        csv_buf = io.BytesIO()
-        analysis.to_csv(csv_buf, index=False)
-        st.download_button("Download Analysis CSV", csv_buf.getvalue(),
-                           "ppg_analysis.csv", "text/csv")
-    else:
-        st.info("Window too short for full HRV analysis — widen the time window.")
-        st.dataframe(signals_df.head(500), width="stretch")
+    _live_refresh = 0.5 if st.session_state.get("live_streaming") and _live_stream_mode else None
 
-    st.divider()
+    @st.fragment(run_every=_live_refresh)
+    def _analysis_display():
+        # ── Streaming mode: compute fresh from buffer ──────────────────────
+        if _live_stream_mode:
+            _lshared   = st.session_state.get("_sshared_live", {})
+            _lbuf      = _lshared.get("buf", [])
+            _ldone     = _lshared.get("done", False)
+            _lstreaming = st.session_state.get("live_streaming", False)
+            _lerror    = _lshared.get("error")
 
-    # ── Section 6: Signal Quality ─────────────────────────────────────────────
+            if _ldone and _lstreaming:
+                st.session_state["live_streaming"] = False
+                _lstreaming = False
 
-    st.markdown('<div class="section-anchor" id="signal-quality"></div>', unsafe_allow_html=True)
-    st.header("Signal Quality")
+            if _lerror:
+                st.error(f"Stream error: {_lerror}")
 
-    st.segmented_control(
-        "Quality Methods", QUALITY_METHODS,
-        selection_mode="multi", default=[QUALITY_METHODS[0]], key="quality_methods",
-    )
+            if not _lbuf:
+                if _lstreaming:
+                    st.info("Streaming… waiting for first samples.")
+                else:
+                    st.info("No stream data yet. Configure connection in sidebar and press ▶ Start.")
+                if _ldone and not st.session_state.get("_live_finalised"):
+                    st.session_state["_live_finalised"] = True
+                    st.rerun()
+                return
 
-    _quality_map    = {}
-    _quality_errors = {}
-    for _qm in quality_methods:
-        _qres = cached_pipeline(signal_bytes, sampling_rate, clean_method, peak_method, _qm)
-        if _qres["quality"] is not None:
-            _qa = np.array(_qres["quality"])
-            _minlen = min(len(timestamps_w), len(_qa))
-            _quality_map[_qm] = _qa[:_minlen]
-        elif _qres["quality_error"]:
-            _quality_errors[_qm] = _qres["quality_error"]
-        else:
-            _quality_errors[_qm] = "not available"
+            # Build full arrays from buffer
+            _lall_ts  = np.array([s[0] for s in _lbuf], dtype=np.float64)
+            _lch_key  = st.session_state.get("live_channel", "ch3")
+            _lch_idx  = {"ch1": 1, "ch2": 2, "ch3": 3, "ch4": 4}[_lch_key]
+            _lall_sig = np.array([s[_lch_idx] for s in _lbuf], dtype=np.float64)
 
-    if _quality_map:
-        _common_len  = min(len(v) for v in _quality_map.values())
-        _aligned_map = {m: v[:_common_len] for m, v in _quality_map.items()}
-        st.caption("Box-select a region to zoom all charts")
-        ev_qual = st.plotly_chart(
-            plot_quality(timestamps_w[:_common_len], _aligned_map),
-            width="stretch", key=f"chart_qual_{'_'.join(quality_methods)}",
-            on_select="rerun", selection_mode="box",
-        )
-        _b = _extract_box_x(ev_qual)
-        if _b:
-            st.session_state._pending_window = (max(_t0, min(_b)), min(_t1, max(_b)))
-            st.rerun()
-
-        _mcols = st.columns(max(1, len(_quality_map)))
-        for _col, (_qm, _qa) in zip(_mcols, _quality_map.items()):
-            _mean = float(np.nanmean(_qa))
-            _good_refs   = QUALITY_REFS.get(_qm, [])
-            _good_thresh = next((v for v, _, lbl in _good_refs if "good" in lbl or "boundary" in lbl), None)
-            if _good_thresh is not None:
-                _pct = float(np.mean(_qa >= _good_thresh) * 100)
-                _col.metric(f"{_qm}", f"{_mean:.3f}", f"{_pct:.0f}% above {_good_thresh}")
-            elif _qm == "skewness":
-                _pct = float(np.mean(_qa >= 0.0) * 100)
-                _col.metric(f"{_qm}", f"{_mean:.3f}", f"{_pct:.0f}% above 0")
+            # Rolling SR from last 200 timestamps
+            _lsr_win = min(len(_lall_ts), 200)
+            if _lsr_win >= 2:
+                _ldiffs = np.diff(_lall_ts[-_lsr_win:])
+                _lpos   = _ldiffs[_ldiffs > 0]
+                _lmed   = float(np.median(_lpos)) if len(_lpos) else 10.0
+                _lsr    = 1000.0 / _lmed
             else:
-                _col.metric(f"{_qm}", f"{_mean:.3f}", f"σ={float(np.nanstd(_qa)):.3f}")
+                _lsr = 100.0
 
-    for _qm, _err in _quality_errors.items():
-        st.warning(f"**{_qm}**: `{_err}`")
+            # Apply SR override if set
+            if st.session_state.get("live_override_sr"):
+                _lsr = float(st.session_state.get("live_manual_sr", _lsr))
 
-    _dl_button("Export Signal Quality CSV", _ex(), "signal_quality.csv", "dl_qual")
+            # Store for sidebar metric
+            st.session_state["_live_computed_sr"] = _lsr
+            _lsampling_rate = _lsr
+
+            # Display window: last 15 s
+            _lkeep_n  = max(10, int(_LIVE_DISPLAY_S * _lsampling_rate))
+            _ldisp_ts  = _lall_ts[-_lkeep_n:]
+            _ldisp_sig = _lall_sig[-_lkeep_n:]
+
+            # Analysis window: trailing N seconds
+            _lanalysis_s = float(st.session_state.get("live_analysis_window_s", 5))
+            _lanal_n = max(10, int(_lanalysis_s * _lsampling_rate))
+            _ltimestamps_w  = _ldisp_ts[-_lanal_n:]
+            _lsignal_w_orig = _ldisp_sig[-_lanal_n:]
+
+            # Apply signal transform
+            _lsignal_w, _lflip_baseline = apply_signal_transform(
+                _lsignal_w_orig,
+                mode=transform_mode,
+                adc_bits=adc_bits,
+                flip_sliding=flip_ac_sliding,
+                flip_window_s=flip_ac_window_s,
+                sampling_rate=_lsampling_rate,
+            )
+
+            if len(_lsignal_w) < 10:
+                st.info(f"Collecting data… {len(_lbuf):,} samples so far (need ≥{_lanal_n} for {_lanalysis_s}s window)")
+                return
+
+            # Run pipeline (no cache — rolling buffer changes each refresh)
+            try:
+                _lresults = run_pipeline(
+                    _lsignal_w, _lsampling_rate, clean_method, peak_method, quality_method,
+                )
+            except Exception as _le:
+                st.error(f"Pipeline error: {_le}")
+                return
+
+            _lcleaned     = _lresults["cleaned"]
+            _lsignals_df  = _lresults["signals_df"]
+            _linfo        = _lresults["info"]
+            _lquality     = _lresults["quality"]
+            _lanalysis    = _lresults["analysis"]
+            _lpeak_idx    = _linfo.get("PPG_Peaks", np.array([], dtype=int))
+            _lhr_m, _lhr_lo, _lhr_hi = compute_hr_metrics(_lpeak_idx, _lsampling_rate)
+
+            # Streaming status banner
+            if _lstreaming:
+                st.info(f"Streaming — {len(_lbuf):,} samples received · {_lsampling_rate:.1f} Hz live SR")
+
+            # Unpack into generic names for shared rendering below
+            _a_ts        = _ltimestamps_w
+            _a_sig_w     = _lsignal_w
+            _a_sig_orig  = _lsignal_w_orig
+            _a_flip_bl   = _lflip_baseline
+            _a_sr        = _lsampling_rate
+            _a_cleaned   = _lcleaned
+            _a_sig_df    = _lsignals_df
+            _a_info      = _linfo
+            _a_quality   = _lquality
+            _a_analysis  = _lanalysis
+            _a_peaks     = _lpeak_idx
+            _a_hr_m      = _lhr_m
+            _a_hr_lo     = _lhr_lo
+            _a_hr_hi     = _lhr_hi
+            _a_sig_col   = _lch_key
+            _a_t0        = float(_ltimestamps_w[0])
+            _a_t1        = float(_ltimestamps_w[-1])
+            _a_nrows     = len(_lbuf)
+            _a_ncols     = 5
+            _a_df_raw    = None
+            _a_sig_bytes = _lsignal_w.tobytes()
+
+            # Finalise when done
+            if _ldone and not _lstreaming and not st.session_state.get("_live_finalised"):
+                st.session_state["_live_finalised"] = True
+                st.rerun()
+
+        else:
+            # File mode: use outer-scope variables
+            _a_ts        = timestamps_w
+            _a_sig_w     = signal_w
+            _a_sig_orig  = signal_w_orig
+            _a_flip_bl   = _flip_baseline
+            _a_sr        = sampling_rate
+            _a_cleaned   = cleaned
+            _a_sig_df    = signals_df
+            _a_info      = info
+            _a_quality   = quality
+            _a_analysis  = analysis
+            _a_peaks     = peak_indices
+            _a_hr_m      = hr_mean
+            _a_hr_lo     = hr_min
+            _a_hr_hi     = hr_max
+            _a_sig_col   = signal_col
+            _a_t0        = _t0
+            _a_t1        = _t1
+            _a_nrows     = len(df_raw)
+            _a_ncols     = len(df_raw.columns)
+            _a_df_raw    = df_raw
+            _a_sig_bytes = signal_bytes
+
+        # ── Shared convenience helpers ─────────────────────────────────────
+        _c = _a_sig_col.replace("-", "_")
+
+        def _ex_shared():
+            """Build export DataFrame — works for both file and streaming mode."""
+            n   = len(_a_ts)
+            df  = pd.DataFrame({
+                "timestamp_ms":    _a_ts,
+                f"{_c}_raw":       _a_sig_orig,
+                f"{_c}_cleaned":   _a_cleaned,
+                "PPG_Peak":        _a_sig_df["PPG_Peaks"].values.astype(int)
+                                   if not _a_sig_df.empty else np.zeros(n, dtype=int),
+                "PPG_Rate_bpm":    _a_sig_df["PPG_Rate"].values
+                                   if "PPG_Rate" in _a_sig_df.columns
+                                   else np.full(n, np.nan),
+            })
+            if not _live_stream_mode:
+                for _qm in quality_methods:
+                    _qr = cached_pipeline(_a_sig_bytes, _a_sr, clean_method, peak_method, _qm)
+                    _q  = _qr["quality"]
+                    if _q is not None:
+                        _qa = np.array(_q)
+                        mn  = min(n, len(_qa))
+                        df[f"quality_{_qm}"] = np.concatenate([_qa[:mn], np.full(n - mn, np.nan)])
+                    else:
+                        df[f"quality_{_qm}"] = np.nan
+            return df
+
+        def _dl(label, df, filename, key):
+            st.download_button(label, df.to_csv(index=False).encode(),
+                               filename, "text/csv", key=key, width="stretch")
+
+        # ── Section 1: Raw Data ───────────────────────────────────────────
+
+        st.markdown('<div class="section-anchor" id="raw-data"></div>', unsafe_allow_html=True)
+        st.header("Raw Data")
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Rows",              _a_nrows)
+        col2.metric("Columns",           _a_ncols)
+        col3.metric("Duration (window)", f"{(_a_ts[-1] - _a_ts[0]) / 1000:.1f} s")
+        col4.metric("SR",                f"{_a_sr:.1f} Hz")
+
+        st.caption("Box-select a region to zoom all charts")
+        ev_raw = st.plotly_chart(
+            plot_raw_signal(_a_ts, _a_sig_w, _a_sig_col,
+                            original=_a_sig_orig if _signal_transformed else None,
+                            baseline=_a_flip_bl),
+            width="stretch", key="chart_raw", on_select="rerun", selection_mode="box",
+        )
+        _b = _extract_box_x(ev_raw)
+        if _b and not _live_stream_mode:
+            st.session_state._pending_window = (max(_a_t0, min(_b)), min(_a_t1, max(_b)))
+            st.rerun()
+
+        st.subheader("Signal Statistics")
+        st.dataframe(pd.Series(_a_sig_w, name=_a_sig_col).describe().to_frame().T, width="stretch")
+
+        if _a_df_raw is not None:
+            with st.expander("Data Preview (full file, head 200)"):
+                st.dataframe(_a_df_raw.head(200), width="stretch")
+        elif _live_stream_mode:
+            _lshared_p = st.session_state.get("_sshared_live", {})
+            _lbuf_p    = _lshared_p.get("buf", [])
+            if _lbuf_p:
+                with st.expander(f"Stream buffer preview (last 200 of {len(_lbuf_p):,} samples)"):
+                    _preview_df = pd.DataFrame(_lbuf_p[-200:],
+                                               columns=["timestamp_ms","ch1","ch2","ch3","ch4"])
+                    st.dataframe(_preview_df, width="stretch")
+
+        _dl("Export Raw CSV", _ex_shared()[["timestamp_ms", f"{_c}_raw"]], "raw_signal.csv", "dl_raw")
+
+        st.divider()
+
+        # ── Section 2: Processed Signal ───────────────────────────────────
+
+        st.markdown('<div class="section-anchor" id="processed-signal"></div>', unsafe_allow_html=True)
+        st.header("Processed Signal")
+
+        _pcol1, _pcol2 = st.columns(2)
+        _pcol1.selectbox("Cleaning Method", CLEAN_METHODS,
+                         index=CLEAN_METHODS.index(clean_method), key="clean_method")
+        _pcol2.selectbox("Peak Detection Method", PEAK_METHODS,
+                         index=PEAK_METHODS.index(peak_method), key="peak_method")
+
+        show_raw_overlay = st.checkbox("Show raw signal", value=False, key="show_raw_overlay")
+        st.caption("Box-select a region to zoom all charts")
+        ev_proc = st.plotly_chart(
+            plot_cleaned_overlay(_a_ts, _a_sig_w if show_raw_overlay else None, _a_cleaned, _a_sig_col),
+            width="stretch", key="chart_proc", on_select="rerun", selection_mode="box",
+        )
+        _b = _extract_box_x(ev_proc)
+        if _b and not _live_stream_mode:
+            st.session_state._pending_window = (max(_a_t0, min(_b)), min(_a_t1, max(_b)))
+            st.rerun()
+        st.caption(f"Cleaning method: **{clean_method}** | SR: **{_a_sr:.1f} Hz**")
+
+        _dl("Export Processed CSV",
+            _ex_shared()[["timestamp_ms", f"{_c}_raw", f"{_c}_cleaned"]],
+            "processed_signal.csv", "dl_proc")
+
+        st.divider()
+
+        # ── Section 3: Peak Detection ─────────────────────────────────────
+
+        st.markdown('<div class="section-anchor" id="peak-detection"></div>', unsafe_allow_html=True)
+        st.header("Peak Detection")
+
+        st.caption("Box-select a region to zoom all charts")
+        ev_peaks = st.plotly_chart(plot_peaks(_a_ts, _a_cleaned, _a_peaks),
+                                   width="stretch", key="chart_peaks",
+                                   on_select="rerun", selection_mode="box")
+        _b = _extract_box_x(ev_peaks)
+        if _b and not _live_stream_mode:
+            st.session_state._pending_window = (max(_a_t0, min(_b)), min(_a_t1, max(_b)))
+            st.rerun()
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Peaks Detected", len(_a_peaks))
+        if _a_hr_m is not None:
+            m2.metric("Mean HR", f"{_a_hr_m:.1f} bpm")
+            m3.metric("Min HR",  f"{_a_hr_lo:.1f} bpm")
+            m4.metric("Max HR",  f"{_a_hr_hi:.1f} bpm")
+
+        st.caption(f"Peak method: **{peak_method}** | Cleaning: **{clean_method}**")
+
+        _dl("Export Peaks CSV",
+            _ex_shared()[["timestamp_ms", f"{_c}_raw", f"{_c}_cleaned", "PPG_Peak", "PPG_Rate_bpm"]],
+            "peak_detection.csv", "dl_peaks")
+
+        if show_nk_plot:
+            with st.expander("NeuroKit2 Native Plot", expanded=True):
+                try:
+                    fig_nk = nk.ppg_plot(_a_sig_df, _a_info)
+                    st.pyplot(fig_nk)
+                    plt.close(fig_nk)
+                except Exception as e:
+                    st.warning(f"Could not render NeuroKit2 native plot: {e}")
+
+        st.divider()
+
+        # ── Section 4: Individual Beats ───────────────────────────────────
+
+        st.markdown('<div class="section-anchor" id="individual-beats"></div>', unsafe_allow_html=True)
+        st.header("Individual Beats")
+
+        beat_pre  = st.session_state.get("beat_pre",  0.2)
+        beat_post = st.session_state.get("beat_post", 0.5)
+
+        if len(_a_peaks) < 2:
+            st.warning("Not enough peaks detected to segment individual beats.")
+        else:
+            try:
+                epochs = cached_epochs(
+                    _a_cleaned.tobytes(), _a_peaks.astype(np.int64).tobytes(),
+                    _a_sr, -beat_pre, beat_post,
+                )
+                hr_mean_beats, _, _ = compute_hr_metrics(_a_peaks, _a_sr)
+                st.plotly_chart(
+                    plot_individual_beats(epochs, hr_mean_beats),
+                    width="stretch", key=f"chart_beats_{beat_pre}_{beat_post}",
+                )
+                st.caption(f"{len(epochs)} beats | window: −{beat_pre}s to +{beat_post}s around each peak")
+            except Exception as e:
+                st.error(f"Beat segmentation failed: {e}")
+
+        st.subheader("Beat Segmentation")
+        bc1, bc2 = st.columns(2)
+        with bc1:
+            st.slider("Pre-peak window (s)",  0.1, 0.5, step=0.05, key="beat_pre")
+        with bc2:
+            st.slider("Post-peak window (s)", 0.2, 1.0, step=0.05, key="beat_post")
+
+        st.divider()
+
+        # ── Section 5: HRV / Analysis ─────────────────────────────────────
+
+        st.markdown('<div class="section-anchor" id="hrv-analysis"></div>', unsafe_allow_html=True)
+        st.header("HRV / Analysis")
+
+        if _a_analysis is not None:
+            st.dataframe(_a_analysis, width="stretch")
+            csv_buf = io.BytesIO()
+            _a_analysis.to_csv(csv_buf, index=False)
+            st.download_button("Download Analysis CSV", csv_buf.getvalue(),
+                               "ppg_analysis.csv", "text/csv")
+        else:
+            st.info("Window too short for full HRV analysis — widen the time window.")
+            if not _a_sig_df.empty:
+                st.dataframe(_a_sig_df.head(500), width="stretch")
+
+        st.divider()
+
+        # ── Section 6: Signal Quality ─────────────────────────────────────
+
+        st.markdown('<div class="section-anchor" id="signal-quality"></div>', unsafe_allow_html=True)
+        st.header("Signal Quality")
+
+        st.segmented_control(
+            "Quality Methods", QUALITY_METHODS,
+            selection_mode="multi", default=[QUALITY_METHODS[0]], key="quality_methods",
+        )
+
+        _quality_map    = {}
+        _quality_errors = {}
+        for _qm in quality_methods:
+            if _live_stream_mode:
+                # Direct call — no cache for streaming
+                try:
+                    _qres = run_pipeline(_a_sig_w, _a_sr, clean_method, peak_method, _qm)
+                    if _qres["quality"] is not None:
+                        _qa = np.array(_qres["quality"])
+                        _minlen = min(len(_a_ts), len(_qa))
+                        _quality_map[_qm] = _qa[:_minlen]
+                    elif _qres["quality_error"]:
+                        _quality_errors[_qm] = _qres["quality_error"]
+                    else:
+                        _quality_errors[_qm] = "not available"
+                except Exception as _qe:
+                    _quality_errors[_qm] = str(_qe)
+            else:
+                _qres = cached_pipeline(_a_sig_bytes, _a_sr, clean_method, peak_method, _qm)
+                if _qres["quality"] is not None:
+                    _qa = np.array(_qres["quality"])
+                    _minlen = min(len(_a_ts), len(_qa))
+                    _quality_map[_qm] = _qa[:_minlen]
+                elif _qres["quality_error"]:
+                    _quality_errors[_qm] = _qres["quality_error"]
+                else:
+                    _quality_errors[_qm] = "not available"
+
+        if _quality_map:
+            _common_len  = min(len(v) for v in _quality_map.values())
+            _aligned_map = {m: v[:_common_len] for m, v in _quality_map.items()}
+            st.caption("Box-select a region to zoom all charts")
+            ev_qual = st.plotly_chart(
+                plot_quality(_a_ts[:_common_len], _aligned_map),
+                width="stretch", key=f"chart_qual_{'_'.join(quality_methods)}",
+                on_select="rerun", selection_mode="box",
+            )
+            _b = _extract_box_x(ev_qual)
+            if _b and not _live_stream_mode:
+                st.session_state._pending_window = (max(_a_t0, min(_b)), min(_a_t1, max(_b)))
+                st.rerun()
+
+            _mcols = st.columns(max(1, len(_quality_map)))
+            for _col, (_qm, _qa) in zip(_mcols, _quality_map.items()):
+                _mean = float(np.nanmean(_qa))
+                _good_refs   = QUALITY_REFS.get(_qm, [])
+                _good_thresh = next((v for v, _, lbl in _good_refs if "good" in lbl or "boundary" in lbl), None)
+                if _good_thresh is not None:
+                    _pct = float(np.mean(_qa >= _good_thresh) * 100)
+                    _col.metric(f"{_qm}", f"{_mean:.3f}", f"{_pct:.0f}% above {_good_thresh}")
+                elif _qm == "skewness":
+                    _pct = float(np.mean(_qa >= 0.0) * 100)
+                    _col.metric(f"{_qm}", f"{_mean:.3f}", f"{_pct:.0f}% above 0")
+                else:
+                    _col.metric(f"{_qm}", f"{_mean:.3f}", f"σ={float(np.nanstd(_qa)):.3f}")
+
+        for _qm, _err in _quality_errors.items():
+            st.warning(f"**{_qm}**: `{_err}`")
+
+        _dl("Export Signal Quality CSV", _ex_shared(), "signal_quality.csv", "dl_qual")
+
+        # ── Streaming mode: full buffer export ────────────────────────────
+        if _live_stream_mode:
+            _lshared_ex = st.session_state.get("_sshared_live", {})
+            _lbuf_ex    = _lshared_ex.get("buf", [])
+            _lraw_ex    = _lshared_ex.get("raw", b"")
+            if _lbuf_ex:
+                st.divider()
+                st.subheader("Full Stream Export")
+                _fdf = pd.DataFrame(_lbuf_ex, columns=["timestamp_ms","ch1","ch2","ch3","ch4"])
+                _edl1, _edl2 = st.columns(2)
+                with _edl1:
+                    st.download_button(
+                        "Export full stream CSV",
+                        _fdf.to_csv(index=False).encode(),
+                        "stream_full.csv", "text/csv",
+                        key="dl_live_csv_full", width="stretch",
+                    )
+                with _edl2:
+                    st.download_button(
+                        "Export raw binary (.bin)",
+                        bytes(_lraw_ex),
+                        "stream_full.bin", "application/octet-stream",
+                        key="dl_live_bin_full", width="stretch",
+                        help=f"{len(_lraw_ex):,} bytes — 20 bytes/sample",
+                    )
+                if st.button("Clear stream data", key="live_clear_btn"):
+                    for _k in ("_sshared_live", "_live_finalised", "_live_computed_sr"):
+                        st.session_state.pop(_k, None)
+                    st.rerun()
+
+    _analysis_display()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Tab 2: USB Serial
@@ -866,8 +1252,6 @@ with _tab_serial:
 
     # ── Start / Stop buttons ──────────────────────────────────────────────────
 
-    import threading as _threading
-
     _is_streaming = st.session_state.get("serial_streaming", False)
 
     _btn_col1, _btn_col2 = st.columns([3, 1])
@@ -883,12 +1267,12 @@ with _tab_serial:
         )
 
     if _stop_btn and _is_streaming:
-        st.session_state.get("serial_stop_event", _threading.Event()).set()
+        st.session_state.get("serial_stop_event", threading.Event()).set()
         _conn_log("Stream stopped by user", "warn")
 
     if _capture_btn and not _is_streaming:
         # All shared state lives in a plain dict — thread never touches st.session_state
-        _stop_ev = _threading.Event()
+        _stop_ev = threading.Event()
         _shared: dict = {
             "buf":      [],
             "raw":      bytearray(),
@@ -928,7 +1312,7 @@ with _tab_serial:
             finally:
                 _shared["done"] = True   # fragment detects this and flips serial_streaming
 
-        _t = _threading.Thread(target=_stream_worker, daemon=True)
+        _t = threading.Thread(target=_stream_worker, daemon=True)
         _t.start()
         _conn_log(f"Stream start: {_capture_n} samples from {_capture_port} "
                   f"({'live' if _live_mode else 'batch'})", "info")
@@ -957,21 +1341,21 @@ with _tab_serial:
             st.session_state["serial_streaming"] = False
             _streaming = False
 
-        # ── Progress bar while active ─────────────────────────────────────────
+        # ── Progress bar while active ─────────────────────────────────────
         if _streaming or (_done and _buf):
             _requested = st.session_state.get("serial_n_samples", 1)
             _pct = min(int(len(_buf) / max(_requested, 1) * 100), 100)
-            _stopped = _error or st.session_state.get("serial_stop_event", _threading.Event()).is_set()
+            _stopped = _error or st.session_state.get("serial_stop_event", threading.Event()).is_set()
             _label = (f"Receiving… {len(_buf)}/{_requested} samples"
                       if _streaming else
                       f"{'Stopped' if _stopped else 'Complete'} — {len(_buf)} samples")
             st.progress(_pct, text=_label)
 
-        # ── Error banner ──────────────────────────────────────────────────────
+        # ── Error banner ──────────────────────────────────────────────────
         if _error:
             st.error(f"Stream error: {_error}")
 
-        # ── Chart — show live during streaming, or final result ───────────────
+        # ── Chart — show live during streaming, or final result ───────────
         _show_chart = _buf and (_streaming or _done)
         if _show_chart:
             _CH_COLORS  = {"Ch1 (ambient)": "#aaa", "Ch2 (ambient)": "#888",
@@ -1004,7 +1388,7 @@ with _tab_serial:
             st.plotly_chart(_fig, width="stretch")
             st.caption("Ch3/Ch4 = PPG (IN3 paired)  |  Ch1/Ch2 = ambient  |  toggle in legend")
 
-        # ── Metrics + export — available as soon as there is ANY data ─────────
+        # ── Metrics + export — available as soon as there is ANY data ─────
         if _buf:
             _ch3 = [s[3] for s in _buf]
             _ts_ms_b = [s[0] for s in _buf]
@@ -1043,7 +1427,7 @@ with _tab_serial:
                     help=f"{len(_raw_bytes_dl):,} bytes — 20 bytes/sample (timestamp_ms + ch1-4 uint32 LE)",
                 )
 
-        # ── Finalise to persistent keys once done so clear/reload works ───────
+        # ── Finalise to persistent keys once done so clear/reload works ───
         if _done and _buf and not _streaming and not st.session_state.get("_sfinalised"):
             st.session_state["serial_last_samples"]   = list(_buf)
             st.session_state["serial_last_raw_bytes"] = bytes(_raw_buf)
@@ -1051,7 +1435,7 @@ with _tab_serial:
             _msg = f"Stream complete: {len(_buf)} samples"
             if _error:
                 _conn_log(f"Stream ended with error: {_error}", "error")
-            elif st.session_state.get("serial_stop_event", _threading.Event()).is_set():
+            elif st.session_state.get("serial_stop_event", threading.Event()).is_set():
                 _conn_log(f"Stream stopped by user: {len(_buf)} samples kept", "warn")
             else:
                 _conn_log(_msg, "ok")
@@ -1059,7 +1443,7 @@ with _tab_serial:
             # Outer rerun resets run_every → None (stops auto-refresh)
             st.rerun()
 
-        # ── Stream log ────────────────────────────────────────────────────────
+        # ── Stream log ────────────────────────────────────────────────────
         if _log_buf:
             with st.expander("Stream log"):
                 st.code("\n".join(_log_buf), language="text")
@@ -1138,9 +1522,14 @@ with _tab_serial:
             st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sidebar: all-in-one export (Analysis tab only)
+# Sidebar: all-in-one export (file modes only)
 # ─────────────────────────────────────────────────────────────────────────────
 
-with st.sidebar:
-    st.divider()
-    _dl_button("Export All Data", _ex(), "all_data.csv", "dl_all")
+if not _live_stream_mode:
+    with st.sidebar:
+        st.divider()
+        _dl_button("Export All Data",
+                   make_export_df(timestamps_w, signal_w, cleaned, signals_df,
+                                  signal_col, signal_bytes, sampling_rate,
+                                  clean_method, peak_method, quality_methods),
+                   "all_data.csv", "dl_all")
