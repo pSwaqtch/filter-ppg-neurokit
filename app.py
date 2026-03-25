@@ -222,24 +222,80 @@ with st.sidebar:
             st.error("`pyserial` not installed — `pip install pyserial`")
             st.stop()
 
-        _live_ports = list_serial_ports()
+        _live_connected   = st.session_state.get("live_connected", False)
+        _live_active_port = st.session_state.get("live_active_port", "")
+        _live_active_baud = st.session_state.get("live_active_baud", 115200)
         _live_is_streaming = st.session_state.get("live_streaming", False)
 
+        # ── Port / baud + Connect/Disconnect ─────────────────────────────
+        _live_ports = list_serial_ports()
+        _lock = _live_connected or _live_is_streaming
+
         if _live_ports:
-            _live_port_default = st.session_state.get("live_port", _live_ports[0])
-            _live_port_idx = _live_ports.index(_live_port_default) if _live_port_default in _live_ports else 0
+            _live_port_default = _live_active_port if _live_active_port in _live_ports else _live_ports[0]
+            _live_port_idx = _live_ports.index(_live_port_default)
             live_port = st.selectbox("Serial Port", _live_ports, index=_live_port_idx,
-                                     key="live_port", disabled=_live_is_streaming)
+                                     key="live_port", disabled=_lock)
         else:
-            live_port = st.text_input("Serial Port (manual)", "/dev/tty.usbmodem101",
-                                      key="live_port_manual", disabled=_live_is_streaming)
+            live_port = st.text_input("Serial Port (manual)", _live_active_port or "/dev/tty.usbmodem101",
+                                      key="live_port_manual", disabled=_lock)
 
         _baud_opts_live = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
-        _live_baud_default = st.session_state.get("live_baud", 115200)
-        _live_baud_idx = _baud_opts_live.index(_live_baud_default) if _live_baud_default in _baud_opts_live else 4
+        _live_baud_idx = _baud_opts_live.index(_live_active_baud) if _live_active_baud in _baud_opts_live else 4
         live_baud = st.selectbox("Baud Rate", _baud_opts_live, index=_live_baud_idx,
-                                  key="live_baud", disabled=_live_is_streaming)
+                                  key="live_baud", disabled=_lock)
 
+        _conn_col1, _conn_col2 = st.columns(2)
+        with _conn_col1:
+            if not _live_connected:
+                if st.button("Connect", type="primary", width="stretch", key="live_conn_btn"):
+                    _chk = test_connection(live_port, live_baud)
+                    if _chk.ok:
+                        st.session_state["live_connected"]   = True
+                        st.session_state["live_active_port"] = live_port
+                        st.session_state["live_active_baud"] = live_baud
+                        st.session_state.pop("live_conn_error", None)
+                    else:
+                        st.session_state["live_conn_error"] = _chk.error or "Connection failed"
+                    st.rerun()
+            else:
+                if st.button("Disconnect", type="secondary", width="stretch", key="live_disconn_btn"):
+                    # Stop streaming first if active
+                    if _live_is_streaming:
+                        ev = st.session_state.get("live_stop_event")
+                        if ev:
+                            ev.set()
+                    st.session_state["live_connected"]   = False
+                    st.session_state["live_streaming"]   = False
+                    st.session_state.pop("live_conn_error", None)
+                    st.rerun()
+        with _conn_col2:
+            if st.button("Refresh", width="stretch", key="live_refresh_btn", disabled=_lock):
+                st.rerun()
+
+        # ── Connection status ─────────────────────────────────────────────
+        _live_conn_err = st.session_state.get("live_conn_error", "")
+        if _live_connected:
+            _ldesc_map = {p["device"]: p["description"] for p in describe_ports()}
+            _ldesc = _ldesc_map.get(_live_active_port, _live_active_port)
+            st.success(f"**{_live_active_port}** @ {_live_active_baud} · {_ldesc}")
+        elif _live_conn_err:
+            st.error(_live_conn_err)
+        else:
+            st.caption("Not connected.")
+
+        if not _live_connected:
+            st.stop()
+
+        st.divider()
+
+        # ── Stream configuration (only when connected) ────────────────────
+        _ODR_OPTIONS = [10, 25, 50, 100, 200, 400]
+        live_odr = st.select_slider(
+            "ODR (Hz)", options=_ODR_OPTIONS, value=100, key="live_odr",
+            help="Sends `adpd ppg freq <hz>` before starting stream. Supported: 10/25/50/100/200/400 Hz",
+            disabled=_live_is_streaming,
+        )
         live_channel = st.selectbox(
             "PPG Channel", ["ch1", "ch2", "ch3", "ch4"], index=2, key="live_channel",
             help="Ch3/Ch4 = PPG (IN3 paired), Ch1/Ch2 = ambient",
@@ -262,6 +318,10 @@ with st.sidebar:
         with _lc1:
             if st.button("▶ Start", disabled=_live_is_streaming, type="primary",
                          width="stretch", key="live_start_btn"):
+                # Send ODR command first (best-effort — ignore errors)
+                send_command(_live_active_port, _live_active_baud,
+                             f"adpd ppg freq {live_odr}", response_timeout_s=2.0)
+
                 _live_stop_ev = threading.Event()
                 _live_shared: dict = {
                     "buf":   [],
@@ -276,8 +336,8 @@ with st.sidebar:
                 st.session_state["_live_finalised"]  = False
                 st.session_state.pop("_live_computed_sr", None)
 
-                _lport   = live_port
-                _lbaud   = live_baud
+                _lport   = _live_active_port
+                _lbaud   = _live_active_baud
                 _lnsampl = live_n_samples
 
                 def _live_worker():
@@ -318,7 +378,7 @@ with st.sidebar:
         _lbuf_disp    = _lshared_disp.get("buf", [])
         _lerr_disp    = _lshared_disp.get("error")
         if _live_is_streaming:
-            st.info(f"Streaming — {len(_lbuf_disp):,} samples received")
+            st.info(f"Streaming — {len(_lbuf_disp):,} samples @ {live_odr} Hz")
         elif _lerr_disp:
             st.error(f"Stream error: {_lerr_disp}")
         elif _lbuf_disp:
@@ -1171,14 +1231,49 @@ with _tab_serial:
     st.subheader("Command Console")
 
     _KNOWN_CMDS = [
+        # ── Diagnostics ──────────────────────────────────────────────────
+        "help",
+        "adpd probe",
+        "adpd probe sdk",
+        "adpd dump",
+        "adpd diag",
+        # ── PPG control ──────────────────────────────────────────────────
+        "adpd ppg start",
+        "adpd ppg stop",
+        "adpd ppg freq",
+        "adpd ppg freq 10",
+        "adpd ppg freq 25",
+        "adpd ppg freq 50",
+        "adpd ppg freq 100",
+        "adpd ppg freq 200",
+        "adpd ppg freq 400",
+        # ── Streaming ─────────────────────────────────────────────────────
+        "adpd ppg stream 20",
+        "adpd ppg stream 100",
+        "adpd ppg stream 500",
         "adpd ppg stream-bin 100",
         "adpd ppg stream-bin 500",
         "adpd ppg stream-bin 1000",
-        "adpd ppg start",
-        "adpd ppg stop",
-        "adpd ppg status",
-        "adpd status",
-        "help",
+        "adpd ppg stream-bin 5000",
+        "adpd ppg stream-bin 10000",
+        # ── Register access ───────────────────────────────────────────────
+        "adpd read 0x010",
+        "adpd read 0x128",
+        "adpd write 0x128 0x000A",
+        # ── EEPROM ───────────────────────────────────────────────────────
+        "eeprom info",
+        "eeprom test",
+        "eeprom read 0x0100",
+        "eeprom write 0x0100 0xFF",
+        # ── Bus scan ─────────────────────────────────────────────────────
+        "scan i2c",
+        "scan spi",
+        # ── System ───────────────────────────────────────────────────────
+        "reset",
+        "interface usb on",
+        "interface usb off",
+        "interface uart on",
+        "interface uart off",
     ]
 
     # on_change fills the text input BEFORE it renders — avoids SessionState conflict
