@@ -1291,39 +1291,57 @@ with _tab_serial:
         return node
 
     # ── Session state ─────────────────────────────────────────────────────────
-    _tokens = st.session_state.setdefault("_cmd_tokens", [])
-    _node   = _flow_navigate(_tokens)
+    _tokens  = st.session_state.setdefault("_cmd_tokens", [])
+    _node    = _flow_navigate(_tokens)
     _cmd_str = " ".join(str(t) for t in _tokens)
     _can_send = _node is None or (isinstance(_node, dict) and _node.get("_optional_end"))
 
-    # ── Token chip display ────────────────────────────────────────────────────
+    # ── Chip strip + backspace/clear ──────────────────────────────────────────
     _chip_css = (
-        "display:inline-flex; align-items:center; padding:3px 12px; margin:2px 3px; "
-        "border-radius:16px; background:#1a3550; color:#7ec8e3; "
-        "font-size:0.82rem; font-family:monospace; font-weight:600; letter-spacing:0.02em;"
+        "display:inline-flex; align-items:center; padding:2px 10px; margin:2px 3px; "
+        "border-radius:14px; background:#1a3550; color:#7ec8e3; "
+        "font-size:0.82rem; font-family:monospace; font-weight:600;"
     )
     if _tokens:
         _chips_html = "".join(f'<span style="{_chip_css}">{t}</span>' for t in _tokens)
         st.markdown(
-            f'<div style="margin:4px 0 8px 0; line-height:2">{_chips_html}</div>',
+            f'<div style="margin:4px 0 6px 0; line-height:2.2">{_chips_html}</div>',
             unsafe_allow_html=True,
         )
-        _cmd_preview_col, _bk_col, _rst_col = st.columns([6, 1, 1])
-        with _cmd_preview_col:
-            st.code(_cmd_str, language="bash")
+        _bk_col, _rst_col, _ = st.columns([1, 1, 6])
         with _bk_col:
             if st.button("⌫", key="cmd_backspace", help="Remove last token", width="stretch"):
                 st.session_state["_cmd_tokens"].pop()
+                st.session_state["_cmd_next_select"] = None
                 st.rerun()
         with _rst_col:
             if st.button("✕", key="cmd_reset_chips", help="Clear all", width="stretch"):
                 st.session_state["_cmd_tokens"] = []
+                st.session_state["_cmd_next_select"] = None
                 st.rerun()
-    else:
-        st.caption("Pick tokens to build your command:")
 
-    # ── Next input: value widget or option chips ───────────────────────────────
-    if isinstance(_node, dict) and "_input" in _node:
+    # ── Single persistent search bar (dict nodes) ─────────────────────────────
+    if isinstance(_node, dict) and "_input" not in _node:
+        _choices = [k for k in _node if not k.startswith("_")]
+        if _choices:
+            def _on_token_select():
+                val = st.session_state.get("_cmd_next_select")
+                if val is not None:
+                    st.session_state["_cmd_tokens"].append(val)
+                    st.session_state["_cmd_next_select"] = None
+
+            st.selectbox(
+                "token",
+                options=_choices,
+                index=None,
+                placeholder="type to search…",
+                key="_cmd_next_select",
+                on_change=_on_token_select,
+                label_visibility="collapsed",
+            )
+
+    # ── Value input (number / hex / odr) ──────────────────────────────────────
+    elif isinstance(_node, dict) and "_input" in _node:
         _itype  = _node["_input"]
         _ilabel = _node.get("_label", "value")
         _iopts  = _node.get("_options")
@@ -1331,14 +1349,15 @@ with _tab_serial:
         _iv_col, _iadd_col = st.columns([5, 1])
         with _iv_col:
             if _itype == "odr":
-                _ival = st.select_slider(
-                    _ilabel, options=_iopts, value=100,
+                _ival = st.selectbox(
+                    _ilabel, options=_iopts, index=None,
+                    placeholder="select ODR (Hz)…",
                     key=f"_cmd_ival_{len(_tokens)}",
                     label_visibility="collapsed",
                 )
             elif _itype == "count":
                 _ival = st.number_input(
-                    _ilabel, min_value=1, max_value=100_000, value=500, step=50,
+                    _ilabel, min_value=1, max_value=100_000, value=None, step=50,
                     key=f"_cmd_ival_{len(_tokens)}",
                     placeholder=_ilabel, label_visibility="collapsed",
                 )
@@ -1348,33 +1367,22 @@ with _tab_serial:
                     placeholder=_ilabel, label_visibility="collapsed",
                 )
         with _iadd_col:
-            _ival_ok = bool(str(_ival).strip()) if _ival is not None else False
+            _ival_ok = _ival is not None and str(_ival).strip() != ""
             if st.button("Add →", key="cmd_add_val", type="primary",
                          width="stretch", disabled=not _ival_ok):
                 st.session_state["_cmd_tokens"].append(str(_ival).strip())
                 st.rerun()
 
-    elif isinstance(_node, dict):
-        # Option chips for next token
-        _choices = [k for k in _node if not k.startswith("_")]
-        if _choices:
-            _chip_cols = st.columns(min(len(_choices), 7))
-            for _i, _choice in enumerate(_choices):
-                if _chip_cols[_i % len(_chip_cols)].button(
-                    _choice, key=f"cmd_chip_{len(_tokens)}_{_i}",
-                    use_container_width=True,
-                ):
-                    st.session_state["_cmd_tokens"].append(_choice)
-                    st.rerun()
-
-    # ── Send (shown when command is complete) ─────────────────────────────────
+    # ── Send ──────────────────────────────────────────────────────────────────
     if _tokens and _can_send:
-        _resp_timeout = st.session_state.get("serial_resp_timeout", 3.0)
-        if st.button(f"Send ↵", type="primary", width="stretch", key="cmd_send_final"):
-            with st.spinner(f"Sending `{_cmd_str}`…"):
+        if st.button(f"Send ↵  `{_cmd_str}`", type="primary",
+                     width="stretch", key="cmd_send_final"):
+            _resp_timeout = st.session_state.get("serial_resp_timeout", 3.0)
+            with st.spinner(f"Sending…"):
                 _result = send_command(_active_port, _active_baud, _cmd_str,
                                        response_timeout_s=_resp_timeout)
             st.session_state["_cmd_tokens"] = []
+            st.session_state["_cmd_next_select"] = None
             if _result.ok:
                 _conn_log(f">> {_cmd_str}", "info")
                 if _result.response:
@@ -1386,45 +1394,9 @@ with _tab_serial:
                 _conn_log(f"Command error: {_result.error}", "error")
                 st.error(f"Error: {_result.error}")
 
-    # ── Manual override (free-text for custom/advanced commands) ──────────────
-    with st.expander("Manual command (advanced)", expanded=False):
-        def _apply_manual():
-            manual = st.session_state.get("_cmd_manual_preset")
-            if manual:
-                st.session_state["serial_cmd_manual_input"] = manual
-                st.session_state["_cmd_manual_preset"] = None
-
-        _manual_input = st.text_input(
-            "Command", key="serial_cmd_manual_input",
-            label_visibility="collapsed", placeholder="Type any command…",
-        )
-        _mtout_col, _msend_col = st.columns([2, 1])
-        with _mtout_col:
-            st.number_input("Response timeout (s)", min_value=0.5, max_value=30.0,
-                            value=3.0, step=0.5, key="serial_resp_timeout",
-                            label_visibility="visible")
-        with _msend_col:
-            st.markdown("<div style='padding-top:1.6rem'>", unsafe_allow_html=True)
-            _msend = st.button("Send", type="primary", width="stretch", key="serial_manual_send",
-                               disabled=not bool(_manual_input and _manual_input.strip()))
-            st.markdown("</div>", unsafe_allow_html=True)
-
-        if _msend and _manual_input and _manual_input.strip():
-            _mcmd = _manual_input.strip()
-            _mto  = st.session_state.get("serial_resp_timeout", 3.0)
-            with st.spinner(f"Sending `{_mcmd}`…"):
-                _mresult = send_command(_active_port, _active_baud, _mcmd,
-                                        response_timeout_s=_mto)
-            if _mresult.ok:
-                _conn_log(f">> {_mcmd}", "info")
-                if _mresult.response:
-                    _conn_log(f"<< {_mresult.response[:120]}", "info")
-                    st.code(_mresult.response, language="text")
-                else:
-                    st.info("No response received within timeout.")
-            else:
-                _conn_log(f"Command error: {_mresult.error}", "error")
-                st.error(f"Error: {_mresult.error}")
+    with st.expander("Response timeout", expanded=False):
+        st.number_input("Timeout (s)", min_value=0.5, max_value=30.0,
+                        value=3.0, step=0.5, key="serial_resp_timeout")
 
     st.divider()
 
