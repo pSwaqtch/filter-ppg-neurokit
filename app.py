@@ -996,7 +996,7 @@ with _tab_serial:
                 legend=dict(orientation="h", y=1.05),
                 uirevision="stream",   # stable zoom/pan across redraws
             )
-            st.plotly_chart(_fig, use_container_width=True)
+            st.plotly_chart(_fig, width="stretch")
             st.caption("Ch3/Ch4 = PPG (IN3 paired)  |  Ch1/Ch2 = ambient  |  toggle in legend")
 
         # ── Metrics + export — available as soon as there is ANY data ─────────
