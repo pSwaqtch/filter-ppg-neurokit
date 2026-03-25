@@ -74,6 +74,7 @@ class StreamResult:
     - Ch3/Ch4: PPG signal (IN3 paired)
     """
     samples: list[tuple[int, int, int, int, int]] = field(default_factory=list)
+    raw_bytes: bytes = b""          # verbatim payload bytes for debug export
     log: list[str] = field(default_factory=list)
     error: Optional[str] = None
 
@@ -340,6 +341,8 @@ def receive_binary_stream(
 
         if len(buf) < total_bytes:
             result.log.append(f"Timeout: got {len(buf)}/{total_bytes} bytes")
+
+        result.raw_bytes = bytes(buf)   # save verbatim before slicing
 
         # Parse: each 20-byte group → (timestamp_ms, ch1, ch2, ch3, ch4)
         parsed = len(buf) // BYTES_PER_SAMPLE

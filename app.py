@@ -901,8 +901,9 @@ with _tab_serial:
 
         if _stream.ok and _stream.count > 0:
             _conn_log(f"Stream complete: {_stream.count} samples captured", "ok")
-            st.session_state["serial_last_samples"] = _stream.samples
-            st.session_state["serial_last_log"]     = _stream.log
+            st.session_state["serial_last_samples"]   = _stream.samples
+            st.session_state["serial_last_raw_bytes"] = _stream.raw_bytes
+            st.session_state["serial_last_log"]       = _stream.log
         elif not _stream.ok:
             _conn_log(f"Stream error: {_stream.error}", "error")
             st.error(f"Stream error: {_stream.error}")
@@ -914,8 +915,9 @@ with _tab_serial:
 
     # ── Display captured data ─────────────────────────────────────────────────
 
-    _samples = st.session_state.get("serial_last_samples", [])
-    _log     = st.session_state.get("serial_last_log", [])
+    _samples   = st.session_state.get("serial_last_samples", [])
+    _raw_bytes = st.session_state.get("serial_last_raw_bytes", b"")
+    _log       = st.session_state.get("serial_last_log", [])
 
     if _samples:
         import plotly.graph_objects as _go
@@ -965,12 +967,22 @@ with _tab_serial:
             "ch3_ppg":      _ch_arrays["Ch3 (PPG)"],
             "ch4_ppg":      _ch_arrays["Ch4 (PPG)"],
         })
-        st.download_button(
-            "Export Captured CSV",
-            _serial_df.to_csv(index=False).encode(),
-            "serial_capture.csv", "text/csv",
-            key="dl_serial",
-        )
+        _dl1, _dl2 = st.columns(2)
+        with _dl1:
+            st.download_button(
+                "Export Parsed CSV",
+                _serial_df.to_csv(index=False).encode(),
+                "serial_capture.csv", "text/csv",
+                key="dl_serial_csv", width="stretch",
+            )
+        with _dl2:
+            st.download_button(
+                "Export Raw Binary (.bin)",
+                _raw_bytes,
+                "serial_capture.bin", "application/octet-stream",
+                key="dl_serial_bin", width="stretch",
+                help=f"{len(_raw_bytes):,} bytes — verbatim payload, 20 bytes/sample (timestamp_ms + ch1-4 uint32 LE)",
+            )
 
     if _log:
         with st.expander("Stream log"):
@@ -978,6 +990,7 @@ with _tab_serial:
 
     if _samples and st.button("Clear Captured Data", key="serial_clear"):
         st.session_state.pop("serial_last_samples", None)
+        st.session_state.pop("serial_last_raw_bytes", None)
         st.session_state.pop("serial_last_log", None)
         st.rerun()
 
