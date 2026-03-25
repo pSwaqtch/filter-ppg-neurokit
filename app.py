@@ -792,8 +792,8 @@ with _tab_serial:
 
     st.subheader("Binary Stream Capture")
     st.caption(
-        "Sends `adpd ppg stream-bin N` — device starts PPG, streams N × 16 bytes "
-        "(4 × uint32 little-endian per sample), then stops PPG.  "
+        "Sends `adpd ppg stream-bin N` — device starts PPG, streams N × 20 bytes "
+        "(timestamp_ms + 4 × uint32 little-endian per sample), then stops PPG.  "
         "Ch3/Ch4 = PPG (IN3 paired), Ch1/Ch2 = ambient."
     )
 
@@ -846,12 +846,13 @@ with _tab_serial:
     if _samples:
         import plotly.graph_objects as _go
 
-        # _samples is list of (ch1, ch2, ch3, ch4) tuples
+        # _samples is list of (timestamp_ms, ch1, ch2, ch3, ch4) tuples
+        _ts_ms       = [s[0] for s in _samples]
         _ch_arrays = {
-            "Ch1 (ambient)": [s[0] for s in _samples],
-            "Ch2 (ambient)": [s[1] for s in _samples],
-            "Ch3 (PPG)":     [s[2] for s in _samples],
-            "Ch4 (PPG)":     [s[3] for s in _samples],
+            "Ch1 (ambient)": [s[1] for s in _samples],
+            "Ch2 (ambient)": [s[2] for s in _samples],
+            "Ch3 (PPG)":     [s[3] for s in _samples],
+            "Ch4 (PPG)":     [s[4] for s in _samples],
         }
         _ch_colors  = {"Ch1 (ambient)": "#aaa", "Ch2 (ambient)": "#888",
                        "Ch3 (PPG)": "#1f77b4", "Ch4 (PPG)": "#ff7f0e"}
@@ -859,15 +860,15 @@ with _tab_serial:
                        "Ch3 (PPG)": True, "Ch4 (PPG)": True}
 
         _fig_serial = _go.Figure()
-        _xs = list(range(len(_samples)))
         for _ch_name, _ch_vals in _ch_arrays.items():
             _fig_serial.add_trace(_go.Scatter(
-                x=_xs, y=_ch_vals, mode="lines", name=_ch_name,
+                x=_ts_ms, y=_ch_vals, mode="lines", name=_ch_name,
                 line=dict(color=_ch_colors[_ch_name], width=1),
                 visible=_ch_visible[_ch_name],
             ))
+        _duration_serial = (_ts_ms[-1] - _ts_ms[0]) / 1000 if len(_ts_ms) > 1 else 0
         _fig_serial.update_layout(
-            xaxis_title="Sample index",
+            xaxis_title="Time (ms from stream start)",
             yaxis_title="ADC value (uint32)",
             margin=dict(l=0, r=0, t=30, b=0),
             height=380,
@@ -876,14 +877,15 @@ with _tab_serial:
         st.plotly_chart(_fig_serial, width="stretch", key="chart_serial_raw")
         st.caption("Ch3/Ch4 = PPG (IN3 paired)  |  Ch1/Ch2 = ambient  |  toggle channels in legend")
 
-        _s_col1, _s_col2, _s_col3, _s_col4 = st.columns(4)
-        _s_col1.metric("Samples",    len(_samples))
-        _s_col2.metric("Ch3 mean",   f"{int(sum(_ch_arrays['Ch3 (PPG)']) / len(_samples)):,}")
-        _s_col3.metric("Ch3 min",    f"{min(_ch_arrays['Ch3 (PPG)']):,}")
-        _s_col4.metric("Ch3 max",    f"{max(_ch_arrays['Ch3 (PPG)']):,}")
+        _s_col1, _s_col2, _s_col3, _s_col4, _s_col5 = st.columns(5)
+        _s_col1.metric("Samples",       len(_samples))
+        _s_col2.metric("Duration",      f"{_duration_serial:.2f} s")
+        _s_col3.metric("Ch3 mean",      f"{int(sum(_ch_arrays['Ch3 (PPG)']) / len(_samples)):,}")
+        _s_col4.metric("Ch3 min",       f"{min(_ch_arrays['Ch3 (PPG)']):,}")
+        _s_col5.metric("Ch3 max",       f"{max(_ch_arrays['Ch3 (PPG)']):,}")
 
         _serial_df = pd.DataFrame({
-            "sample_index": range(len(_samples)),
+            "timestamp_ms": _ts_ms,
             "ch1_ambient":  _ch_arrays["Ch1 (ambient)"],
             "ch2_ambient":  _ch_arrays["Ch2 (ambient)"],
             "ch3_ppg":      _ch_arrays["Ch3 (PPG)"],

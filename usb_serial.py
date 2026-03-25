@@ -68,11 +68,12 @@ class CommandResult:
 class StreamResult:
     """Outcome of a binary stream capture.
 
-    ``samples`` is a list of (ch1, ch2, ch3, ch4) tuples — one per sample.
-    Each channel value is a little-endian uint32.
-    Ch3/Ch4 carry the PPG signal (IN3 pair); Ch1/Ch2 are ambient.
+    ``samples`` is a list of (timestamp_ms, ch1, ch2, ch3, ch4) tuples.
+    - ``timestamp_ms``: uint32, ms from stream start (first sample = 0)
+    - Ch1/Ch2: ambient channels
+    - Ch3/Ch4: PPG signal (IN3 paired)
     """
-    samples: list[tuple[int, int, int, int]] = field(default_factory=list)
+    samples: list[tuple[int, int, int, int, int]] = field(default_factory=list)
     log: list[str] = field(default_factory=list)
     error: Optional[str] = None
 
@@ -191,8 +192,8 @@ def send_command(
         return CommandResult(command=command, error=f"Unexpected error: {exc}")
 
 
-BYTES_PER_SAMPLE = 16   # 4 channels × 4 bytes each
-CHANNELS = ("ch1", "ch2", "ch3", "ch4")
+BYTES_PER_SAMPLE = 20   # 4-byte timestamp + 4 channels × 4 bytes
+CHANNELS = ("timestamp_ms", "ch1", "ch2", "ch3", "ch4")
 
 
 def receive_binary_stream(
@@ -205,8 +206,9 @@ def receive_binary_stream(
     """Send ``adpd ppg stream-bin <num_samples>`` and parse the binary response.
 
     Protocol (BINARY_STREAMING.md):
-    1. Text start marker:  ``[BIN] Starting binary stream: N samples (4 channels per sample)``
-    2. Payload:            ``num_samples × 16`` bytes — 4 × little-endian uint32 per sample
+    1. Text start marker:  ``[BIN] Starting binary stream: N samples (timestamp + 4 channels)``
+    2. Payload:            ``num_samples × 20`` bytes — 5 × little-endian uint32 per sample
+       - timestamp_ms: ms from stream start (first sample = 0)
        - Ch1, Ch2: ambient
        - Ch3, Ch4: PPG signal (IN3 paired)
     3. Text end marker:    ``[BIN] Stream complete: N samples … sent``
@@ -226,7 +228,7 @@ def receive_binary_stream(
 
     Returns
     -------
-    StreamResult with ``.samples`` as a list of (ch1, ch2, ch3, ch4) tuples.
+    StreamResult with ``.samples`` as a list of (timestamp_ms, ch1, ch2, ch3, ch4) tuples.
     """
     if not SERIAL_AVAILABLE:
         return StreamResult(error="pyserial not installed")
@@ -273,11 +275,11 @@ def receive_binary_stream(
         if len(buf) < total_bytes:
             result.log.append(f"Timeout: got {len(buf)}/{total_bytes} bytes")
 
-        # Parse: each 16-byte group → (ch1, ch2, ch3, ch4)
+        # Parse: each 20-byte group → (timestamp_ms, ch1, ch2, ch3, ch4)
         parsed = len(buf) // BYTES_PER_SAMPLE
-        raw = struct.unpack(f"<{parsed * 4}I", bytes(buf[:parsed * BYTES_PER_SAMPLE]))
+        raw = struct.unpack(f"<{parsed * 5}I", bytes(buf[:parsed * BYTES_PER_SAMPLE]))
         result.samples = [
-            (raw[i * 4], raw[i * 4 + 1], raw[i * 4 + 2], raw[i * 4 + 3])
+            (raw[i * 5], raw[i * 5 + 1], raw[i * 5 + 2], raw[i * 5 + 3], raw[i * 5 + 4])
             for i in range(parsed)
         ]
         result.log.append(f"Parsed {parsed} samples ({parsed * BYTES_PER_SAMPLE} bytes)")
