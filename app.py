@@ -738,16 +738,62 @@ with _tab_serial:
     # ── Command console ───────────────────────────────────────────────────────
 
     st.subheader("Command Console")
-    st.caption("Send any text command to the device and see the response.")
+
+    _KNOWN_CMDS = [
+        "adpd ppg stream-bin 100",
+        "adpd ppg stream-bin 500",
+        "adpd ppg stream-bin 1000",
+        "adpd ppg start",
+        "adpd ppg stop",
+        "adpd ppg status",
+        "adpd status",
+        "help",
+    ]
+
+    # Pending-value pattern: never write to the widget key directly.
+    # Write to serial_cmd_pending instead, then consume it as the initial value
+    # before the widget is instantiated — avoids StreamlitAPIException.
+    _cmd_default = st.session_state.pop("serial_cmd_pending", None)
+    _cmd_kwargs  = {"value": _cmd_default} if _cmd_default is not None else {}
 
     _cmd_col1, _cmd_col2 = st.columns([5, 1])
     with _cmd_col1:
         _cmd_input = st.text_input(
             "Command", key="serial_cmd_input",
-            label_visibility="collapsed", placeholder="Enter command…",
+            label_visibility="collapsed", placeholder="Type a command or pick a suggestion…",
+            **_cmd_kwargs,
         )
     with _cmd_col2:
         _send_clicked = st.button("Send", width="stretch", key="serial_send_btn")
+
+    # Inline suggestions filtered by what the user has typed so far
+    _typed = (_cmd_input or "").strip().lower()
+    _suggestions = [
+        c for c in _KNOWN_CMDS
+        if not _typed or _typed in c.lower()
+    ] if _typed != _cmd_input.strip() or not _typed else [
+        c for c in _KNOWN_CMDS if _typed in c.lower() and c != _cmd_input.strip()
+    ]
+    # Always show suggestions when input is empty, hide exact match
+    if not _typed:
+        _suggestions = _KNOWN_CMDS
+    else:
+        _suggestions = [c for c in _KNOWN_CMDS if _typed in c.lower() and c != _cmd_input.strip()]
+
+    if _suggestions:
+        _sug_cols = st.columns(min(len(_suggestions), 4))
+        for _sci, _sug in enumerate(_suggestions[:4]):
+            with _sug_cols[_sci]:
+                if st.button(_sug, key=f"sug_{_sug}", use_container_width=True):
+                    st.session_state["serial_cmd_pending"] = _sug
+                    st.rerun()
+        if len(_suggestions) > 4:
+            _sug_cols2 = st.columns(min(len(_suggestions) - 4, 4))
+            for _sci, _sug in enumerate(_suggestions[4:8]):
+                with _sug_cols2[_sci]:
+                    if st.button(_sug, key=f"sug2_{_sug}", use_container_width=True):
+                        st.session_state["serial_cmd_pending"] = _sug
+                        st.rerun()
 
     _resp_timeout = st.number_input("Response timeout (s)", min_value=0.5, max_value=30.0,
                                     value=3.0, step=0.5, key="serial_resp_timeout")
@@ -768,23 +814,6 @@ with _tab_serial:
         else:
             _conn_log(f"Command error: {_result.error}", "error")
             st.error(f"Error: {_result.error}")
-
-    # Command quick-pick
-    with st.expander("Common Commands"):
-        _common_cmds = [
-            "adpd ppg stream-bin 100",
-            "adpd ppg stream-bin 500",
-            "adpd ppg stream-bin 1000",
-            "adpd ppg start",
-            "adpd ppg stop",
-            "adpd ppg status",
-            "adpd status",
-            "help",
-        ]
-        for _cc in _common_cmds:
-            if st.button(_cc, key=f"cmd_preset_{_cc}"):
-                st.session_state["serial_cmd_input"] = _cc
-                st.rerun()
 
     st.divider()
 
