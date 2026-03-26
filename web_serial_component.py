@@ -106,11 +106,8 @@ button:disabled {{ opacity: 0.5; cursor: not-allowed; }}
 <body>
 <div class="container">
   <div class="row">
-    <div class="col">
-      <label for="port-select" style="display: block; margin-bottom: 4px; font-size: 13px;">Serial Port</label>
-      <select id="port-select">
-        <option value="">-- Select Port --</option>
-      </select>
+    <div class="col compact">
+      <button id="request-btn" style="width: 100%; margin-top: 20px;">Request Port</button>
     </div>
     <div class="col compact">
       <label for="baud-select" style="display: block; margin-bottom: 4px; font-size: 13px;">Baud</label>
@@ -142,7 +139,7 @@ button:disabled {{ opacity: 0.5; cursor: not-allowed; }}
   const streaming = {streaming_js};
 
   // DOM elements
-  const portSelect = document.getElementById("port-select");
+  const requestBtn = document.getElementById("request-btn");
   const baudSelect = document.getElementById("baud-select");
   const connectBtn = document.getElementById("connect-btn");
   const readBtn = document.getElementById("read-btn");
@@ -165,50 +162,32 @@ button:disabled {{ opacity: 0.5; cursor: not-allowed; }}
     baudSelect.appendChild(opt);
   }});
 
-  // Enumerate available ports
-  async function enumeratePorts() {{
-    try {{
-      const ports = await navigator.serial.getPorts();
-      console.log("[Web Serial] Available ports:", ports.length);
-      portSelect.innerHTML = '<option value="">-- Select Port --</option>';
-      ports.forEach((p, i) => {{
-        const opt = document.createElement("option");
-        opt.value = p.getInfo().usbProductId ? p.getInfo().usbVendorId + ":" + p.getInfo().usbProductId : "port_" + i;
-        opt.textContent = p.getInfo().usbProductId ? "USB Device " + (i+1) : "Port " + (i+1);
-        opt.dataset.port = JSON.stringify(p.getInfo());
-        portSelect.appendChild(opt);
-      }});
-      if (ports.length > 0) {{
-        portSelect.value = portSelect.options[1].value;
-      }}
-      updateState();
-    }} catch(e) {{
-      setError("Failed to enumerate ports: " + e.message);
-    }}
-  }}
-
-  // Request port from user (permission dialog)
-  async function requestNewPort() {{
+  // Request port from user (opens browser's port picker dialog)
+  async function requestPort() {{
     try {{
       port = await navigator.serial.requestPort();
-      enumeratePorts();
+      const info = port.getInfo();
+      console.log("[Web Serial] Port selected:", info);
+      statusEl.className = "status disconnected";
+      statusEl.textContent = "Port selected. Click 'Connect' to open.";
+      requestBtn.textContent = "Change Port";
+      updateState();
     }} catch(e) {{
       if (e.name !== "NotFoundError") {{
         setError("Port request failed: " + e.message);
+      }} else {{
+        console.log("[Web Serial] Port request cancelled by user");
       }}
     }}
   }}
 
   // Connect to selected port
   async function connect() {{
+    if (!port) {{
+      setError("No port selected. Click 'Request Port' first.");
+      return;
+    }}
     try {{
-      const ports = await navigator.serial.getPorts();
-      const selectedIndex = portSelect.selectedIndex - 1;
-      if (selectedIndex < 0 || selectedIndex >= ports.length) {{
-        setError("No port selected");
-        return;
-      }}
-      port = ports[selectedIndex];
       const baudRate = parseInt(baudSelect.value);
       await port.open({{ baudRate }});
       console.log("[Web Serial] Connected to port with baud", baudRate);
@@ -318,17 +297,16 @@ button:disabled {{ opacity: 0.5; cursor: not-allowed; }}
   }}
 
   // Event listeners
+  requestBtn.addEventListener("click", requestPort);
   connectBtn.addEventListener("click", connect);
   readBtn.addEventListener("click", readOnce);
   disconnectBtn.addEventListener("click", disconnect);
-  portSelect.addEventListener("change", updateState);
 
   // Check for Web Serial API support
   if (!navigator.serial) {{
     setError("Web Serial API not supported in this browser (use Chrome/Edge/newer Firefox)");
+    requestBtn.disabled = true;
     connectBtn.disabled = true;
-  }} else {{
-    enumeratePorts();
   }}
 }})();
 </script>
