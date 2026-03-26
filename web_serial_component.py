@@ -265,18 +265,18 @@ button:disabled {{ opacity: 0.5; cursor: not-allowed; }}
   function setConnected(baudRate) {{
     statusEl.className = "status connected";
     statusEl.textContent = "✓ Connected @ " + baudRate + " baud";
-    connectBtn.textContent = "Reconnect";
+    connectBtn.textContent = "Disconnect";
     dataSection.classList.remove("hidden");
-    portSelect.disabled = true;
+    requestBtn.disabled = true;
     baudSelect.disabled = true;
   }}
 
   function setDisconnected() {{
     statusEl.className = "status disconnected";
-    statusEl.textContent = "Not connected";
+    statusEl.textContent = "Port selected. Click 'Connect' to open.";
     connectBtn.textContent = "Connect";
     dataSection.classList.add("hidden");
-    portSelect.disabled = false;
+    requestBtn.disabled = false;
     baudSelect.disabled = false;
     updateState();
   }}
