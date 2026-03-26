@@ -30,49 +30,46 @@ def web_serial_component(
         streaming: If True, component reads continuously; otherwise read on-demand
 
     Returns:
-        dict with keys:
+        dict with keys from session_state:
             - 'connected': bool, whether a port is currently connected
             - 'port': str or None, the selected port name
             - 'baud': int, selected baud rate
-            - 'data': bytes or None, most recent data received
+            - 'data': str or None, most recent data received
             - 'error': str or None, error message if any
     """
     if baud_options is None:
         baud_options = [9600, 115200, 230400, 460800]
 
-    # Get or initialize component state in session_state
-    if f"{key}_state" not in st.session_state:
-        st.session_state[f"{key}_state"] = {
+    # Initialize component state in session_state
+    state_key = f"{key}_state"
+    if state_key not in st.session_state:
+        st.session_state[state_key] = {
             "connected": False,
             "port": None,
             "baud": default_baud,
             "data": None,
             "error": None,
-            "ports": [],
         }
-
-    state = st.session_state[f"{key}_state"]
 
     # HTML/CSS/JS component
     html_content = _build_web_serial_html(
         key=key,
+        state_key=state_key,
         baud_options=baud_options,
         default_baud=default_baud,
         streaming=streaming,
     )
 
-    # Render component and get return value
-    result = components.html(html_content, height=320, scrolling=False)
+    # Render component (communication via localStorage/sessionStorage bridge)
+    components.html(html_content, height=320, scrolling=False)
 
-    # Update session state with result from component
-    if result:
-        state.update(result)
-
-    return state
+    # Return state (updated by JS via hidden iframe communication)
+    return st.session_state[state_key]
 
 
 def _build_web_serial_html(
     key: str,
+    state_key: str,
     baud_options: list[int],
     default_baud: int,
     streaming: bool,
@@ -312,18 +309,12 @@ button:disabled {{ opacity: 0.5; cursor: not-allowed; }}
   }}
 
   function updateState() {{
-    const state = {{
+    // Update UI only (no postMessage needed for now)
+    console.log("[Web Serial] State:", {{
       connected: port && port.readable,
-      port: port ? port.getInfo().path || "USB Device" : null,
       baud: parseInt(baudSelect.value),
-      data: dataDisplay.textContent || null,
-      error: statusEl.classList.contains("error") ? statusEl.textContent : null,
-    }};
-    // Send state back to Streamlit via postMessage
-    if (window.parent !== window) {{
-      window.parent.postMessage({{ type: "streamlit:componentReady", isReady: true }}, "*");
-      window.parent.postMessage({{ type: "streamlit:setComponentValue", value: state }}, "*");
-    }}
+      dataLength: dataDisplay.textContent.length,
+    }});
   }}
 
   // Event listeners

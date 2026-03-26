@@ -1102,25 +1102,15 @@ with _tab_serial:
     st.info("Uses the Web Serial API to connect to USB devices directly from your browser. "
             "Works on localhost AND cloud-hosted Streamlit. Requires Chrome/Edge/newer Firefox.")
 
-    web_state = web_serial_component(
+    web_serial_component(
         key="ppg_serial",
         baud_options=[9600, 115200, 230400, 460800],
         default_baud=115200,
         streaming=False,
     )
 
-    st.write("### State:")
-    st.json({
-        "connected": web_state["connected"],
-        "port": web_state["port"],
-        "baud": web_state["baud"],
-        "data_length": len(web_state["data"]) if web_state["data"] else 0,
-        "error": web_state["error"],
-    })
-
-    if web_state["data"]:
-        st.write("### Raw Data:")
-        st.code(web_state["data"][:500], language="text")
+    st.caption("💡 Use the Web Serial interface above to connect to your USB device. "
+               "All data stays in your browser — no server involvement.")
 
     st.divider()
 
