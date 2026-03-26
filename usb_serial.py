@@ -34,18 +34,26 @@ def list_serial_ports() -> list[str]:
     """Return a list of available serial port device paths, sorted."""
     if not SERIAL_AVAILABLE:
         return []
-    ports = serial.tools.list_ports.comports()
-    return sorted(p.device for p in ports)
+    try:
+        ports = serial.tools.list_ports.comports()
+        return sorted(p.device for p in ports)
+    except Exception:
+        # Cloud/sandbox environments may not support serial port enumeration
+        return []
 
 
 def describe_ports() -> list[dict]:
     """Return rich descriptions (device, description, hwid) for each port."""
     if not SERIAL_AVAILABLE:
         return []
-    return [
-        {"device": p.device, "description": p.description, "hwid": p.hwid}
-        for p in sorted(serial.tools.list_ports.comports(), key=lambda p: p.device)
-    ]
+    try:
+        return [
+            {"device": p.device, "description": p.description, "hwid": p.hwid}
+            for p in sorted(serial.tools.list_ports.comports(), key=lambda p: p.device)
+        ]
+    except Exception:
+        # Cloud/sandbox environments may not support serial port enumeration
+        return []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
