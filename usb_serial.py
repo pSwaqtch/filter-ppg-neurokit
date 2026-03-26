@@ -4,9 +4,9 @@ Protocol reference: BINARY_STREAMING.md
 
 Binary stream format
 --------------------
-- Start marker (text): ``[BIN] Starting binary stream: N samples\\r\\n``
-- Payload: N × 4 bytes, each sample is one little-endian uint32_t
-- End marker (text):   ``\\r\\n[BIN] Stream complete: N samples sent\\r\\n``
+- Start marker (text): ``[BIN] Starting binary stream: N samples\r\n``
+- Payload: N × 20 bytes (1 × uint32 timestamp + 4 × uint32 channels), all little-endian
+- End marker (text):   ``\r\n[BIN] Stream complete: N samples sent\r\n``
 
 This module is Streamlit-free so it can be reused in CLI scripts or tests.
 """
@@ -290,9 +290,9 @@ def receive_binary_stream(
     Protocol (BINARY_STREAMING.md):
     1. Text start marker:  ``[BIN] Starting binary stream: N samples (timestamp + 4 channels)``
     2. Payload:            ``num_samples × 20`` bytes — 5 × little-endian uint32 per sample
-       - timestamp_ms: ms from stream start (first sample = 0)
-       - Ch1, Ch2: ambient
-       - Ch3, Ch4: PPG signal (IN3 paired)
+       - timestamp_ms:     uint32, ms from stream start (first sample = 0)
+       - Ch1, Ch2:         uint32, ambient
+       - Ch3, Ch4:         uint32, PPG signal (IN3 paired)
     3. Text end marker:    ``[BIN] Stream complete: N samples … sent``
 
     Parameters

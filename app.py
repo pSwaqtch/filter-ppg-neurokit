@@ -1276,9 +1276,14 @@ console.log('[APP Console] list_serial_ports returned {len(_ports)} port(s):', {
         },
         "adpd": {
             "probe": {"_optional_end": True, "sdk": None},
-            "dump":  None,
             "diag":  None,
-            "read":  {"_input": "hex",   "_label": "register  e.g. 0x128"},
+            "reset": None,
+            "read":  {
+                "_optional_end": True,
+                "slota": None,
+                "_input": "hex", "_label": "register (or start)  e.g. 0x128",
+                "_next": {"_input": "hex", "_label": "end address", "_optional_end": True}
+            },
             "write": {"_input": "hex",   "_label": "register  e.g. 0x128",
                       "_next":  {"_input": "hex", "_label": "value  e.g. 0x000A"}},
             "ppg": {
@@ -1322,7 +1327,7 @@ console.log('[APP Console] list_serial_ports returned {len(_ports)} port(s):', {
     # CSS inlined once per render to remove inter-column gap in THIS row only
     # by targeting the immediately-following sibling horizontal block.
     _is_value_node = isinstance(_node, dict) and "_input" in _node
-    _is_dict_node  = isinstance(_node, dict) and "_input" not in _node
+    _is_dict_node  = isinstance(_node, dict) and any(not k.startswith("_") for k in _node)
 
     if _tokens:
         _ncols   = len(_tokens) + 1
@@ -1389,7 +1394,7 @@ console.log('[APP Console] list_serial_ports returned {len(_ports)} port(s):', {
 </script>
 """, height=1, scrolling=False)
 
-        elif _is_value_node:
+        if _is_value_node:
             _itype  = _node["_input"]
             _ilabel = _node.get("_label", "value")
             _iopts  = _node.get("_options")
@@ -1453,7 +1458,7 @@ console.log('[APP Console] list_serial_ports returned {len(_ports)} port(s):', {
     st.subheader("Binary Stream Capture")
     st.caption(
         "Sends `adpd ppg stream-bin N` — device starts PPG, streams N × 20 bytes "
-        "(timestamp_ms + 4 × uint32 little-endian per sample), then stops PPG.  "
+        "(4-byte uint32 timestamp + 4 × 4-byte uint32 channels per sample), then stops PPG.  "
         "Ch3/Ch4 = PPG (IN3 paired), Ch1/Ch2 = ambient."
     )
 
