@@ -34,6 +34,8 @@ from usb_serial import (
     send_command, receive_binary_stream, stream_binary_live,
 )
 
+print(f"[STARTUP] SERIAL_AVAILABLE: {SERIAL_AVAILABLE}")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # App-level constants
 # ─────────────────────────────────────────────────────────────────────────────
@@ -229,6 +231,7 @@ with st.sidebar:
 
         # ── Port / baud + Connect/Disconnect ─────────────────────────────
         _live_ports = list_serial_ports()
+        print(f"[APP] USB Stream sidebar: list_serial_ports returned {len(_live_ports)} port(s): {_live_ports}")
         _lock = _live_connected or _live_is_streaming
 
         if _live_ports:
@@ -1103,6 +1106,7 @@ with _tab_serial:
     # ── Port / baud pickers (disabled when connected) ─────────────────────────
 
     _ports = list_serial_ports()
+    print(f"[APP] Command console: list_serial_ports returned {len(_ports)} port(s): {_ports}")
     _sc1, _sc2, _sc3, _sc4 = st.columns([3, 2, 1, 1])
 
     with _sc1:

@@ -33,26 +33,32 @@ except ImportError:
 def list_serial_ports() -> list[str]:
     """Return a list of available serial port device paths, sorted."""
     if not SERIAL_AVAILABLE:
+        print("[DEBUG] serial module not available")
         return []
     try:
         ports = serial.tools.list_ports.comports()
-        return sorted(p.device for p in ports)
-    except Exception:
-        # Cloud/sandbox environments may not support serial port enumeration
+        result = sorted(p.device for p in ports)
+        print(f"[DEBUG] list_serial_ports: found {len(result)} port(s): {result}")
+        return result
+    except Exception as e:
+        print(f"[ERROR] list_serial_ports failed: {type(e).__name__}: {e}")
         return []
 
 
 def describe_ports() -> list[dict]:
     """Return rich descriptions (device, description, hwid) for each port."""
     if not SERIAL_AVAILABLE:
+        print("[DEBUG] serial module not available in describe_ports")
         return []
     try:
-        return [
+        result = [
             {"device": p.device, "description": p.description, "hwid": p.hwid}
             for p in sorted(serial.tools.list_ports.comports(), key=lambda p: p.device)
         ]
-    except Exception:
-        # Cloud/sandbox environments may not support serial port enumeration
+        print(f"[DEBUG] describe_ports: found {len(result)} port(s)")
+        return result
+    except Exception as e:
+        print(f"[ERROR] describe_ports failed: {type(e).__name__}: {e}")
         return []
 
 
