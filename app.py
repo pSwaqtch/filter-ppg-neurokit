@@ -35,6 +35,12 @@ from usb_serial import (
 )
 
 print(f"[STARTUP] SERIAL_AVAILABLE: {SERIAL_AVAILABLE}")
+# Log to browser console as well
+st.components.v1.html(f"""
+<script>
+console.log('[STARTUP] SERIAL_AVAILABLE: {SERIAL_AVAILABLE}');
+</script>
+""", height=1)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # App-level constants
@@ -232,6 +238,11 @@ with st.sidebar:
         # ── Port / baud + Connect/Disconnect ─────────────────────────────
         _live_ports = list_serial_ports()
         print(f"[APP] USB Stream sidebar: list_serial_ports returned {len(_live_ports)} port(s): {_live_ports}")
+        st.components.v1.html(f"""
+<script>
+console.log('[APP USB] list_serial_ports returned {len(_live_ports)} port(s):', {_live_ports});
+</script>
+""", height=1)
         _lock = _live_connected or _live_is_streaming
 
         if _live_ports:
@@ -1107,6 +1118,11 @@ with _tab_serial:
 
     _ports = list_serial_ports()
     print(f"[APP] Command console: list_serial_ports returned {len(_ports)} port(s): {_ports}")
+    st.components.v1.html(f"""
+<script>
+console.log('[APP Console] list_serial_ports returned {len(_ports)} port(s):', {_ports});
+</script>
+""", height=1)
     _sc1, _sc2, _sc3, _sc4 = st.columns([3, 2, 1, 1])
 
     with _sc1:
