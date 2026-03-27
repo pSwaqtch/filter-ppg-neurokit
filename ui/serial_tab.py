@@ -58,14 +58,15 @@ _SERIAL_CSS = """
     line-height: 2.4;   /* vertically centers text against the input widget */
     white-space: nowrap;
 }
-/* Response area — green left border for ok, red for error */
-.resp-ok  { border-left: 3px solid #00CC96; padding: 0.35rem 0.75rem;
-            background: rgba(0,204,150,0.06); border-radius: 0 4px 4px 0;
-            margin-bottom: 0.4rem; }
-.resp-err { border-left: 3px solid #EF553B; padding: 0.35rem 0.75rem;
-            background: rgba(239,85,59,0.06); border-radius: 0 4px 4px 0;
-            margin-bottom: 0.4rem; }
-.resp-cmd { font-family: monospace; font-size: 0.8rem; opacity: 0.9; }
+/* Console output panel label */
+.console-label {
+    font-size: 0.65rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: rgba(255,255,255,0.3);
+    margin-bottom: 0.3rem;
+}
 </style>
 """
 
@@ -244,32 +245,35 @@ def _render_connection_panel():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _send(cmd: str):
-    """Send a command and store the result in session state.
+    """Send a command, append to the rolling terminal history, then rerun.
 
-    Result is stored first, then st.rerun() is called so the response banner
-    at the top of the console is populated on the very next render.  Without
-    the rerun the Streamlit top-to-bottom execution order would render the
-    response area *before* the button handler runs, leaving it blank.
+    History is stored first so the terminal panel is populated on the very
+    next render — without the rerun Streamlit's top-to-bottom pass would
+    render the terminal *before* the button handler fires, leaving it stale.
     """
     port    = st.session_state.get("conn_port", "")
     baud    = st.session_state.get("conn_baud", 115200)
     timeout = st.session_state.get("serial_resp_timeout", 3.0)
+    ts      = datetime.datetime.now().strftime("%H:%M:%S")
     with st.spinner(f"`{cmd}`"):
         result = send_command(port, baud, cmd, response_timeout_s=timeout)
+
     if result.ok:
         _log(f">> {cmd}", "info")
         if result.response:
-            # Truncate long responses in the log to avoid noise
-            _log(f"<< {result.response[:120]}", "info")
-        st.session_state["_cmd_last_response"] = {
-            "cmd": cmd, "text": result.response or "(no response)", "ok": True,
-        }
+            _log(f"<< {result.response[:120]}", "info")  # truncate conn log only
+        entry = {"ts": ts, "cmd": cmd, "text": result.response or "(no response)", "ok": True}
     else:
         _log(f"Error ({cmd}): {result.error}", "error")
-        st.session_state["_cmd_last_response"] = {
-            "cmd": cmd, "text": result.error or "Unknown error", "ok": False,
-        }
-    # Rerun so the response banner at the top of the console is immediately visible
+        entry = {"ts": ts, "cmd": cmd, "text": result.error or "Unknown error", "ok": False}
+
+    # Append to rolling history; cap at 100 entries to bound HTML size
+    history = st.session_state.setdefault("_cmd_history", [])
+    history.append(entry)
+    if len(history) > 100:
+        del history[:-100]
+
+    # Rerun so the terminal panel reflects the new entry immediately
     st.rerun()
 
 
@@ -354,6 +358,27 @@ def _form_row_2(form_key: str, prefix: str,
                 st.warning("Both fields are required.")
 
 
+def _form_row_3(form_key: str, prefix: str,
+                ph1: str, ph2: str, ph3: str):
+    """Three-value command row: [prefix] [v1] [v2] [v3] [Run ↵]
+
+    Used for commands requiring three arguments — e.g. adpd gpio set <idx> <mode> <out_sel>.
+    All three fields must be non-empty before the command is sent.
+    """
+    with st.form(form_key, enter_to_submit=True, border=False):
+        c1, c2, c3, c4, c5 = st.columns([2.5, 2, 2, 2, 1.5])
+        c1.markdown(f'<div class="cmd-prefix">{prefix}</div>', unsafe_allow_html=True)
+        v1 = c2.text_input("v1", placeholder=ph1, label_visibility="collapsed")
+        v2 = c3.text_input("v2", placeholder=ph2, label_visibility="collapsed")
+        v3 = c4.text_input("v3", placeholder=ph3, label_visibility="collapsed")
+        sent = c5.form_submit_button("Run ↵", use_container_width=True, type="primary")
+        if sent:
+            if v1.strip() and v2.strip() and v3.strip():
+                _send(f"{prefix} {v1.strip()} {v2.strip()} {v3.strip()}")
+            else:
+                st.warning("All three fields are required.")
+
+
 def _form_ppg_stream(form_key: str, slot: str, binary: bool):
     """PPG stream row: [prefix] [count] [HR channel] [Run ↵]
 
@@ -398,141 +423,236 @@ def _form_ppg_stream(form_key: str, slot: str, binary: bool):
             _send(cmd)
 
 
+def _render_terminal_panel():
+    """Scrollable terminal-style output panel for command history.
+
+    Rendered via st.components.v1.html so that JavaScript can auto-scroll
+    the div to the bottom after each new entry — giving a real terminal feel.
+    Each history entry is colour-coded:
+      - sent command  : blue
+      - ok response   : green
+      - error response: red
+    """
+    history = st.session_state.get("_cmd_history", [])
+
+    # Header row: label + clear button
+    hc1, hc2 = st.columns([5, 1])
+    hc1.markdown('<div class="console-label">Output</div>', unsafe_allow_html=True)
+    with hc2:
+        if st.button("Clear", key="clear_terminal", help="Clear terminal history",
+                     use_container_width=True):
+            st.session_state.pop("_cmd_history", None)
+            st.rerun()
+
+    # Build the inner HTML — each entry is sent-command + response lines
+    def _esc(s: str) -> str:
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    if not history:
+        body = (
+            "<span style='color:#484f58;font-style:italic'>"
+            "No output yet — run a command."
+            "</span>"
+        )
+    else:
+        parts = []
+        for entry in history:
+            ts   = _esc(entry.get("ts", ""))
+            cmd  = _esc(entry.get("cmd", ""))
+            text = entry.get("text", "")
+            ok   = entry.get("ok", True)
+
+            # Sent command line
+            parts.append(
+                f'<div>'
+                f'<span class="t-ts">[{ts}]</span> '
+                f'<span class="t-prompt">&gt;&gt;</span> '
+                f'<span class="t-send">{cmd}</span>'
+                f'</div>'
+            )
+
+            # Response: split multi-line output into individual rows
+            resp_cls = "t-ok" if ok else "t-err"
+            if text and text != "(no response)":
+                for line in _esc(text).splitlines():
+                    if line.strip():
+                        parts.append(f'<div><span class="{resp_cls}">   {line}</span></div>')
+            elif text == "(no response)":
+                parts.append('<div><span class="t-dim">   (no response within timeout)</span></div>')
+
+            parts.append('<div class="t-gap"></div>')
+
+        body = "\n".join(parts)
+
+    html = f"""
+    <style>
+      #console-out {{
+        background   : #0d1117;
+        color        : #c9d1d9;
+        font-family  : 'SFMono-Regular', 'Consolas', 'Liberation Mono', monospace;
+        font-size    : 0.76rem;
+        line-height  : 1.55;
+        padding      : 0.7rem 0.9rem;
+        border-radius: 6px;
+        border       : 1px solid rgba(255,255,255,0.08);
+        height       : 460px;
+        overflow-y   : auto;
+        word-break   : break-all;
+        white-space  : pre-wrap;
+        box-sizing   : border-box;
+      }}
+      .t-send   {{ color: #79c0ff; }}
+      .t-ok     {{ color: #3fb950; }}
+      .t-err    {{ color: #f85149; }}
+      .t-ts     {{ color: #3d444d; font-size: 0.68rem; }}
+      .t-prompt {{ color: #3d444d; }}
+      .t-dim    {{ color: #484f58; font-style: italic; }}
+      .t-gap    {{ height: 0.4rem; }}
+    </style>
+    <div id="console-out">{body}</div>
+    <script>
+      /* Auto-scroll to bottom so newest entry is always visible */
+      var el = document.getElementById('console-out');
+      if (el) el.scrollTop = el.scrollHeight;
+    </script>
+    """
+    # height matches the terminal div height + label row + small buffer
+    st.components.v1.html(html, height=490, scrolling=False)
+
+
 def _render_command_console():
     st.subheader("Command Console")
 
-    # ── Response timeout — top-level, not buried in an expander ───────────────
-    # Placed first so it is always visible; value is read by _send() on every call.
-    tc1, tc2, tc3 = st.columns([2, 1, 4])
-    tc1.number_input(
-        "Response timeout (s)",
-        min_value=0.5, max_value=30.0, value=3.0, step=0.5,
-        key="serial_resp_timeout",
-    )
-    with tc2:
-        # Spacer aligns the button to the vertical midpoint of the number input
-        st.markdown("<div style='height:1.9rem'></div>", unsafe_allow_html=True)
-        if st.button("Clear response", key="clear_resp", help="Clear last response display"):
-            st.session_state.pop("_cmd_last_response", None)
-            st.rerun()
+    # Two-column layout: terminal output on the left, command palette on the right
+    col_term, col_palette = st.columns([2, 3])
 
-    # ── Last response banner — always at the top so eyes don't hunt for it ────
-    resp = st.session_state.get("_cmd_last_response")
-    if resp:
-        css  = "resp-ok" if resp["ok"] else "resp-err"
-        icon = "✓" if resp["ok"] else "✗"
-        st.markdown(
-            f'<div class="{css}"><span class="resp-cmd">{icon}  {resp["cmd"]}</span></div>',
-            unsafe_allow_html=True,
+    with col_term:
+        _render_terminal_panel()
+
+    with col_palette:
+        # ── Response timeout — always visible at top of palette ───────────────
+        # _send() reads this on every call; no need to hunt for it.
+        st.number_input(
+            "Response timeout (s)",
+            min_value=0.5, max_value=30.0, value=3.0, step=0.5,
+            key="serial_resp_timeout",
         )
-        if resp["text"] and resp["text"] != "(no response)":
-            st.code(resp["text"], language="text")
-        elif resp["text"] == "(no response)":
-            st.caption("_(no response within timeout)_")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # SYSTEM — board-level utility commands
-    # ─────────────────────────────────────────────────────────────────────────
-    _sec("System")
-    _btn_row([
-        ("help",      "help"),
-        ("reset",     "reset"),
-        ("scan i2c",  "scan i2c"),
-        ("scan spi",  "scan spi"),
-    ], "sys", n_cols=4)
+        # ─────────────────────────────────────────────────────────────────────
+        # SYSTEM — board-level utility commands
+        # ─────────────────────────────────────────────────────────────────────
+        _sec("System")
+        _btn_row([
+            ("help",       "help"),
+            ("reset",      "reset"),
+            ("rtos stats", "rtos stats"),  # RTOS task state, priority, stack HWM
+            ("scan i2c",   "scan i2c"),
+            ("scan spi",   "scan spi"),
+        ], "sys", n_cols=4)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # PPG CONTROL — start/stop streaming and ODR/sample-count configuration
-    # ─────────────────────────────────────────────────────────────────────────
-    _sec("PPG Control")
+        # ─────────────────────────────────────────────────────────────────────
+        # PPG CONTROL — start/stop streaming and ODR/sample-count configuration
+        # ─────────────────────────────────────────────────────────────────────
+        _sec("PPG Control")
 
-    # Slot selector — drives the prefix for freq/stream/stream-bin commands.
-    # slota = 4-channel (Ch1–4); slotab = 8-channel (Ch1–4 + Ch5–8).
-    slot = st.radio(
-        "Slot", ["slota", "slotab"], horizontal=True,
-        key="ppg_slot_sel",
-        help="slota = 4 channels (Slot A only) · slotab = 8 channels (Slot A + B)",
-    )
+        # Slot selector — drives the prefix for freq/stream/stream-bin commands.
+        # slota = 4-channel (Ch1–4); slotab = 8-channel (Ch1–4 + Ch5–8).
+        slot = st.radio(
+            "Slot", ["slota", "slotab"], horizontal=True,
+            key="ppg_slot_sel",
+            help="slota = 4 channels (Slot A only) · slotab = 8 channels (Slot A + B)",
+        )
 
-    # Start buttons always show both slot variants; stop needs no slot prefix
-    _btn_row([
-        ("slota start", "adpd ppg slota start"),
-        ("slotab start", "adpd ppg slotab start"),
-        ("stop",         "adpd ppg stop"),
-    ], "ppg_ctrl", n_cols=4)
+        # Start buttons always show both slot variants; stop needs no slot prefix
+        _btn_row([
+            ("slota start", "adpd ppg slota start"),
+            ("slotab start", "adpd ppg slotab start"),
+            ("stop",         "adpd ppg stop"),
+        ], "ppg_ctrl", n_cols=4)
 
-    # ODR — query current setting (no arg) or set a new one (selectbox).
-    # Command uses selected slot; form_key includes slot to force re-render on change.
-    _btn_row([(f"freq?", f"adpd ppg {slot} freq")], f"ppg_freq_q_{slot}", n_cols=4)
-    _form_row_1(f"f_ppg_freq_{slot}", f"adpd ppg {slot} freq",
-                placeholder="", select_opts=_ODR_OPTIONS, select_default=100)
+        # ODR — query current setting (no arg) or set a new value.
+        # freq has no slot prefix per firmware docs; applies globally.
+        _btn_row([("freq?", "adpd ppg freq")], "ppg_freq_q", n_cols=4)
+        _form_row_1("f_ppg_freq", "adpd ppg freq",
+                    placeholder="", select_opts=_ODR_OPTIONS, select_default=100)
 
-    # ASCII text stream — N samples, human-readable CSV over serial.
-    # Optional HR column: appends `hr on <ch>` when a channel is selected.
-    _form_ppg_stream(f"f_ppg_stream_{slot}",     slot, binary=False)
+        # ASCII text stream — N samples, human-readable CSV over serial.
+        # Optional HR column: appends `hr on <ch>` when a channel is selected.
+        _form_ppg_stream(f"f_ppg_stream_{slot}",     slot, binary=False)
 
-    # Binary framed stream — N × 20-byte frames (ts + ch1–4 uint32 LE).
-    # Same HR option; use for high-speed capture and offline analysis.
-    _form_ppg_stream(f"f_ppg_stream_bin_{slot}", slot, binary=True)
+        # Binary framed stream — N × 20-byte frames (ts + ch1–4 uint32 LE).
+        # Same HR option; use for high-speed capture and offline analysis.
+        _form_ppg_stream(f"f_ppg_stream_bin_{slot}", slot, binary=True)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # ADPD DEVICE — register access and device diagnostics
-    # ─────────────────────────────────────────────────────────────────────────
-    _sec("ADPD Device")
-    _btn_row([
-        ("probe",       "adpd probe"),       # SPI comms check — expects chip ID 0x01C6
-        ("probe sdk",   "adpd probe sdk"),   # SDK-level initialisation path check
-        ("diag",        "adpd diag"),        # Current ODR, FIFO status, channel config
-        ("read all",    "adpd read"),        # Dump first 32 registers (0x00–0x1F)
-        ("read slota",  "adpd read slota"),  # Global + Slot A config vs expected values
-        ("adpd reset",  "adpd reset"),       # Reset ADPD chip (not the MCU)
-    ], "adpd", n_cols=4)  # 6 items → 2 rows of 4
+        # ─────────────────────────────────────────────────────────────────────
+        # ADPD DEVICE — register access, GPIO, calibration
+        # ─────────────────────────────────────────────────────────────────────
+        _sec("ADPD Device")
+        # Probe + diagnostic template reads (slota and slotab now both supported)
+        _btn_row([
+            ("probe",        "adpd probe"),       # SPI comms check — expects chip ID 0x01C6
+            ("probe sdk",    "adpd probe sdk"),   # SDK-level initialisation path check
+            ("read slota",   "adpd read slota"),  # Global + Slot A config vs expected values
+            ("read slotab",  "adpd read slotab"), # Global + Slot A+B config vs expected values
+            ("adpd reset",   "adpd reset"),       # Software-reset the ADPD7000 sensor
+            ("gpio read",    "adpd gpio read"),   # Show current GPIO0-2 configuration
+        ], "adpd_probe", n_cols=4)  # 6 items → 2 rows of 4
 
-    # Single-register read — e.g. "adpd read 0x128" (LED_POW12)
-    _form_row_1("f_adpd_read",       "adpd read",
-                placeholder="register  e.g. 0x128")
-    # Address-range read — e.g. "adpd read 0010 0138" for a contiguous block
-    _form_row_2("f_adpd_read_range", "adpd read",
-                ph1="start  e.g. 0010", ph2="end  e.g. 0138")
-    # Register write — use with caution while PPG is running
-    _form_row_2("f_adpd_write",      "adpd write",
-                ph1="register  e.g. 0x128", ph2="value  e.g. 0x000A")
+        # Calibration — each subcommand is a self-contained procedure
+        _btn_row([
+            ("calib clk", "adpd calib clk"),  # Measure LF oscillator accuracy vs MCU clock
+            ("calib led", "adpd calib led"),  # LED drive calibration
+            ("calib tia", "adpd calib tia"),  # TIA gain calibration
+        ], "adpd_calib", n_cols=4)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # INTERFACE — enable/disable USB and UART physical interfaces
-    # ─────────────────────────────────────────────────────────────────────────
-    _sec("Interface")
-    _btn_row([
-        ("usb on",    "interface usb on"),
-        ("usb off",   "interface usb off"),
-        ("uart on",   "interface uart on"),
-        ("uart off",  "interface uart off"),
-    ], "iface", n_cols=4)
+        # Register read: range form — e.g. "adpd read 0000 001F" (first 32 registers)
+        _form_row_2("f_adpd_read_range", "adpd read",
+                    ph1="start  e.g. 0000", ph2="end  e.g. 001F")
+        # Register read: single register — e.g. "adpd read 0x128" (LED_POW12)
+        _form_row_1("f_adpd_read",       "adpd read",
+                    placeholder="register  e.g. 0x128")
+        # Register write — use with caution while PPG is running
+        _form_row_2("f_adpd_write",      "adpd write",
+                    ph1="register  e.g. 0x128", ph2="value  e.g. 0x000A")
+        # GPIO set — idx (0-2), mode (output mode), out_sel (function select hex)
+        _form_row_3("f_adpd_gpio_set",   "adpd gpio set",
+                    ph1="idx  0-2", ph2="mode  e.g. 2", ph3="out_sel  e.g. 0x17")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # EEPROM — non-volatile storage read/write for calibration data
-    # ─────────────────────────────────────────────────────────────────────────
-    _sec("EEPROM")
-    _btn_row([
-        ("info", "eeprom info"),
-        ("test", "eeprom test"),
-    ], "ee", n_cols=4)
+        # ─────────────────────────────────────────────────────────────────────
+        # INTERFACE — enable/disable USB and UART physical interfaces
+        # ─────────────────────────────────────────────────────────────────────
+        _sec("Interface")
+        _btn_row([
+            ("usb on",    "interface usb on"),
+            ("usb off",   "interface usb off"),
+            ("uart on",   "interface uart on"),
+            ("uart off",  "interface uart off"),
+        ], "iface", n_cols=4)
 
-    _form_row_1("f_ee_read",  "eeprom read",  placeholder="address  e.g. 0x0100")
-    _form_row_2("f_ee_write", "eeprom write",
-                ph1="address  e.g. 0x0100", ph2="value  e.g. 0xFF")
+        # ─────────────────────────────────────────────────────────────────────
+        # EEPROM — non-volatile storage read/write for calibration data
+        # ─────────────────────────────────────────────────────────────────────
+        _sec("EEPROM")
+        _btn_row([
+            ("info", "eeprom info"),
+            ("test", "eeprom test"),
+        ], "ee", n_cols=4)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # CUSTOM COMMAND — free-form entry for anything not covered above
-    # ─────────────────────────────────────────────────────────────────────────
-    _sec("Custom command")
-    with st.form("f_custom", enter_to_submit=True, border=False):
-        cc1, cc2 = st.columns([9, 1.5])
-        custom = cc1.text_input("custom", placeholder="enter any command…",
-                                label_visibility="collapsed")
-        sent = cc2.form_submit_button("Run ↵", use_container_width=True, type="primary")
-        if sent and custom.strip():
-            _send(custom.strip())
+        _form_row_1("f_ee_read",  "eeprom read",  placeholder="address  e.g. 0x0100")
+        _form_row_2("f_ee_write", "eeprom write",
+                    ph1="address  e.g. 0x0100", ph2="value  e.g. 0xFF")
+
+        # ─────────────────────────────────────────────────────────────────────
+        # CUSTOM COMMAND — free-form entry for anything not covered above
+        # ─────────────────────────────────────────────────────────────────────
+        _sec("Custom command")
+        with st.form("f_custom", enter_to_submit=True, border=False):
+            cc1, cc2 = st.columns([9, 1.5])
+            custom = cc1.text_input("custom", placeholder="enter any command…",
+                                    label_visibility="collapsed")
+            sent = cc2.form_submit_button("Run ↵", use_container_width=True, type="primary")
+            if sent and custom.strip():
+                _send(custom.strip())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
