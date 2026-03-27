@@ -28,10 +28,9 @@ screen /dev/ttyUSB0 115200
 > adpd probe
 [SUCCESS] ID: 0x01C6
 
-# Check diagnostic info
-> adpd diag
---- ADPD DIAGNOSTIC ---
-Current ODR Setting: 100 Hz
+# Check chip configuration
+> adpd read slota
+--- GLOBAL & SLOT A CONFIGURATION (100 Hz PPG) ---
 ...
 ```
 

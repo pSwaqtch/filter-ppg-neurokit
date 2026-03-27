@@ -38,12 +38,13 @@ putty -serial COM3 -serspeed 115200
 ```bash
 > help
 --- SHELL HELP ---
-  help      : Show available commands
-  interface : Toggle shell interfaces: interface <usb|uart> <on|off>
-  scan      : Scan bus: scan i2c, scan spi
-  reset     : Reset MCU via NVIC
-  eeprom    : EEPROM commands: info, test, read <addr>, write <addr> <val>
-  adpd      : ADPD core: probe [sdk], read [start] [end]|slota, write <reg> <val>, reset, ppg [slota|slotab] start|stop|stream|stream-bin|freq [hr on|off] [s<X>ch<Y>]
+  help       : Show available commands
+  interface  : Toggle shell interfaces: interface <usb|uart> <on|off>
+  scan       : Scan bus: scan i2c, scan spi
+  reset      : Reset MCU via NVIC
+  rtos       : RTOS diagnostics: rtos stats
+  eeprom     : EEPROM commands: info, test, read <addr>, write <addr> <val>
+  adpd       : ADPD core: probe [sdk], read [start] [end]|slota|slotab, write <reg> <val>, reset, ppg
 ```
 
 ---
@@ -72,6 +73,18 @@ Enable/disable USB or UART communication.
 > interface uart off   # Disable UART
 ```
 
+#### `rtos stats`
+Display RTOS task diagnostics (State, Priority, Stack High Water Mark).
+```bash
+> rtos stats
+--- RTOS Task Stats ---
+Task             State  Pri  Stack HWM (words free)
+ADPDTask          B     AbN    412
+StreamTask        B     N      256
+EEPROMTask        B     Low    128
+DefaultTask       X     Idle   192
+```
+
 ---
 
 ### Diagnostics & Hardware Probing
@@ -92,33 +105,20 @@ Verify ADPD7000 chip communication.
 - If you get `[WARN] Found data but ID mismatch: 0x00E3` → SPI clock is too fast. Check main.c prescaler.
 - If you get `[FAIL] SPI Communication Error` → Check SPI Mode 3 (CPOL=1, CPHA=1) in main.c.
 
-#### `adpd read [start] [end]` or `adpd read slota`
-Read ADPD7000 registers with flexible address range support. **Safe to run anytime** (uses SDK HAL layer, no resets).
+#### `adpd read [start] [end]` or `adpd read [slota|slotab]`
+Read ADPD7000 registers with flexible support for individual addresses, ranges, or slot-specific diagnostic templates.
 
-**Default read (first 32 registers: 0x0000–0x001F):**
+**Address range read (e.g., first 32 registers):**
 ```bash
-> adpd read
-ADPD7000 Register Map (First 32 Registers):
-     | 00   01   02   03   04   05   06   07
------|--------------------------------------
-0000 | 0000 0000 0040 0000 0000 0000 00A0 0000
-...
-```
-Quick snapshot of all 32 registers (0x00–0x1F) in hexadecimal.
-
-**Address range read (e.g., 0x0010 to 0x0138):**
-```bash
-> adpd read 0010 0138
-ADPD7000 Register Read (0x0010 to 0x0138):
+> adpd read 0000 001F
+ADPD7000 Register Read (0x0000 to 0x001F):
 Addr  | Value
 ------|-------
-0x0010 | 0x0011
-0x0011 | 0x0000
+0x0000 | 0x0005
 ...
-0x0138 | 0x0022
 ```
 
-**Comprehensive configuration check (Global + Slot A):**
+**Diagnostic Template: Slot A (4 channels):**
 ```bash
 > adpd read slota
 --- GLOBAL & SLOT A CONFIGURATION (100 Hz PPG) ---
@@ -126,60 +126,53 @@ Reference: ADPD7000_PPG_SLOTA_ch4.dcfg (VSM Client default)
 
 Addr  | Name               | Default | Actual  | Description
 ------|--------------------|---------|---------|-----------------------------------------
-0x0006| FIFO_TH            | 0x00A0  | 0x00A0  |  FIFO threshold (160 bytes)
-0x0009| CLK32M_TRIM        | 0x0070  | 0x0070  |  32MHz OSC trim
-0x00D | SLOT_PERIOD_A_L    | 0x2580  | 0x2580  |  Slot period low (100 Hz timing)
-0x00E | SLOT_PERIOD_A_H    | 0x0000  | 0x0000  |  Slot period high
-0x00F | OSC_960K_CTL       | 0x0002  | 0x0002  |  OSC_960K_EN = 1
-0x010 | OPMODE             | 0x0011  | 0x0011  |  GO=1, PPG=1
-0x0120| TS_CTRL_A          | 0x0000  | 0x0000  |  Normal sample type
-0x0121| AFE_PATH_A         | 0x4028  | 0x4020  | ✗ TIA+BUF+ADC 1x gain
+0x0010| OPMODE             | 0x0011  | 0x0011  |  GO=1, PPG=1
 ...
-0x0137| DECIMATE_A         | 0xC010  | 0xC010  |  CHANNEL_EN=3 (4ch)
-
---- MISMATCH GUIDE ---
-Registers show status: blank = correct (✓), ✗ = mismatch from default
-
-Example: If 0x0121 shows ✗ 0x4020 instead of 0x4028,
-then the SDK function setting AFE_PATH_A is missing a bit.
 ```
 
-**What's being compared (25 registers total):**
+**Diagnostic Template: Slot AB (8 channels):**
+```bash
+> adpd read slotab
+--- GLOBAL & SLOT A+B CONFIGURATION (100 Hz PPG) ---
+Reference: ADPD7000_PPG_SLOTAB.dcfg
 
-**Global Configuration (6 registers):**
-- 0x006 (FIFO_TH) — FIFO buffer threshold (160 bytes)
-- 0x009 (CLK32M_TRIM) — 32 MHz oscillator trim
-- 0x00D–0x00E (SLOT_PERIOD) — Timing periods for 100 Hz ODR
-- 0x00F (OSC_960K_CTL) — 960 kHz oscillator enable
-- 0x010 (OPMODE) — GO bit and PPG slot enable
-
-**Slot A Signal Path (7 registers):**
-- 0x0120–0x0126: AFE control, input routing, LED tuning
-
-**Slot A LED & Data (12 registers):**
-- 0x0128–0x012C: LED current, pulse timing, integration parameters
-- 0x0134–0x0139: ADC offsets, data sizes, decimation, channel enable
-
-**Use case for SDK migration:**
-1. Run `adpd read slota` before applying SDK functions (baseline)
-2. Note any ✗ (mismatch) indicators
-3. Replace bare-metal register writes with SDK function calls
-4. Run `adpd read slota` again to see which registers the SDK fixed
-5. If register still shows ✗, the SDK function needs parameter adjustment
-6. Iterate until all registers match expected values (✓)
-
-**Safety:**
-- Uses SDK HAL register read (adi_adpd7000_hal_reg_read)
-- Safe to run while PPG is streaming
-- Safe with FreeRTOS concurrent operations
-- No side effects or sensor resets
+Addr  | Name         | Expected | Actual  | Description
+------|--------------|----------|---------|-----------------------------------------
+0x0010| OPMODE       | 0x0021   | 0x0021  |  GO=1, SlotA/B en
+...
+```
 
 #### `adpd write <reg> <val>`
-Modify individual registers (advanced use only). Use with caution when PPG is running.
+Modify individual registers (advanced use only).
 ```bash
-> adpd write 0x128 0x000A    # Set LED current to 10
-Writing 0x000A to ADPD7000 Reg 0x0128...
-SUCCESS
+> adpd write 0x128 0x000A    # Set LED current
+```
+
+#### `adpd reset`
+Software-reset the ADPD7000 sensor.
+```bash
+> adpd reset
+[SUCCESS] ADPD7000 Reset.
+```
+
+#### `adpd gpio read|set <idx> <mode> <out_sel>`
+Configure ADPD7000 GPIO pins (GPIO0-2).
+```bash
+# View current config
+> adpd gpio read
+
+# Set GPIO1 to output 32MHz clock
+> adpd gpio set 1 2 0x17
+```
+
+#### `adpd calib <clk|led|tia>`
+Run hardware calibration procedures.
+```bash
+# Test oscillator accuracy against MCU clock
+> adpd calib clk
+[CLK CAL] Actual freq:  962040 Hz (LF osc)
+[CLK CAL] Error:        +2125 ppm  (+0.2%)
+[CLK CAL] PASS — LF oscillator within +-5%
 ```
 
 ---
@@ -187,62 +180,31 @@ SUCCESS
 ### PPG Control & Streaming
 
 #### `adpd ppg [slota|slotab] start`
-Initialize PPG at the currently configured ODR and start acquisition.
-- `slota`: Start only Slot A (4 channels output).
-- `slotab`: Start both Slot A and Slot B (8 channels output).
-
-```bash
-> adpd ppg slota start
-Initializing ADPD7000 PPG (Slot A) at 100 Hz...
-[OK] PPG running at 100 Hz. Use 'adpd ppg stream' to start output.
-```
+Initialize sensor and start background capture task.
+- `slota`: Start only Slot A (4 channels). Default if slot omitted.
+- `slotab`: Start both Slot A and Slot B (8 channels total).
 
 #### `adpd ppg stop`
-Stop PPG acquisition and return to standby.
-```bash
-> adpd ppg stop
-[OK] PPG stopped.
-```
+Stop sensor and data streaming tasks.
 
-#### `adpd ppg [slota|slotab] freq <hz>`
-Set output data rate before next `adpd ppg start`. Supported: 10, 25, 50, 100 (default), 200, 400 Hz.
+#### `adpd ppg freq <hz>`
+Set Output Data Rate (ODR). Supported: 10, 25, 50, 100, 200, 400.
 ```bash
-> adpd ppg slota freq 50
-ODR set to 50 Hz (will take effect on next PPG start)
-
-> adpd ppg slota freq
-Supported ODRs: 10 Hz, 25 Hz, 50 Hz, 100 Hz, 200 Hz, 400 Hz
-Current ODR: 50 Hz
+> adpd ppg freq 50
+ODR set to 50 Hz...
 ```
 
 #### `adpd ppg [slota|slotab] stream <count> [hr on|off] [s<X>ch<Y>]`
-Stream `count` samples as CSV. 
-- **Heart Rate**: If `hr on` is specified, you **must** also provide a channel (e.g., `sAch1`).
-- **Flexible Order**: Options like `hr on` and `sAch1` can be placed anywhere after the slot prefix.
+Stream CSV data. If `count` is omitted, streams indefinitely.
+- **HR Calculation**: requires `hr on` and a channel source (e.g., `sAch3`).
 
 ```bash
-# Example: Slot A with HR detection on Slot A, Channel 1
-> adpd ppg slota stream 100 hr on sAch1
-Time_ms,Ch1,Ch2,Ch3,Ch4,Peak,HR
-0,0,0,123456,234567,0,0.0
-10,0,0,125678,236789,1,72.5
-...
+# Example: Stream 500 samples of Slot A with HR on Ch3
+> adpd ppg slota stream 500 hr on sAch3
 ```
-
-**Output format:**
-- Time_ms: Milliseconds from stream start
-- Ch1, Ch2: Ambient channels (usually near-zero if LED off)
-- Ch3, Ch4: Signal channels (should show pulsatile waveform when LED on)
 
 #### `adpd ppg [slota|slotab] stream-bin <count> [hr on|off] [s<X>ch<Y>]`
-Stream `count` samples in binary format.
-```bash
-> adpd ppg slotab stream-bin 1000 hr on sBch3
-[BIN] Starting binary stream: 1000 samples (timestamp + 8 channels + HR + Peak)
-[BIN] Stream complete: 1000 samples (44000 bytes) sent
-```
-
-**Output format:** See [BINARY_STREAMING.md](BINARY_STREAMING.md) for details.
+Stream binary data. (See [BINARY_STREAMING.md](BINARY_STREAMING.md)).
 
 ### Heart Rate Detection Summary
 The system includes an integrated DSP pipeline (Hampel Filter → Bandpass → Peak Detection).
