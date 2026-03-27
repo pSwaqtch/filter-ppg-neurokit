@@ -239,7 +239,7 @@ def send_command(
     baud: int,
     command: str,
     response_timeout_s: float = 3.0,
-    response_lines: int = 8,
+    response_lines: int = 50,
 ) -> CommandResult:
     """Send a text command and collect up to *response_lines* lines of response.
 
@@ -257,7 +257,8 @@ def send_command(
     response_timeout_s:
         Total seconds to wait for responses after sending.
     response_lines:
-        Stop after collecting this many non-empty lines.
+        Stop after collecting this many non-empty lines.  Default 50 to handle
+        verbose commands like ``adpd read slota`` (25+ register rows).
 
     Returns
     -------
@@ -292,15 +293,31 @@ def send_command(
 # Binary frame protocol constants  (must match stream_task.h)
 # ─────────────────────────────────────────────────────────────────────────────
 
-FRAME_MAGIC      = bytes([0xAD, 0x7E])   # sync word
-FRAME_OVERHEAD   = 4                      # magic[2] + type[1] + len[1]
+FRAME_MAGIC    = bytes([0xAD, 0x7E])   # sync word
+FRAME_OVERHEAD = 4                      # magic[2] + type[1] + len[1]
 
-STREAM_TYPE_PPG  = 0x01
-PPG_PAYLOAD_SIZE = 20                     # ts_ms(4) + ch[0..3](16) little-endian uint32
+STREAM_TYPE_PPG = 0x01
 
-BYTES_PER_SAMPLE = PPG_PAYLOAD_SIZE       # convenience alias
-CHANNELS         = ("timestamp_ms", "ch1", "ch2", "ch3", "ch4")
-LIVE_CHUNK_BYTES = 240                    # ~10 complete framed PPG samples per read
+# Valid PPG payload sizes — determined by slot config and HR flag:
+#   Slot A, no HR  : ts(4) + 4×ch(16)               = 20 bytes
+#   Slot A + HR    : ts(4) + 4×ch(16) + hr(4)+peak(4) = 28 bytes
+#   Slot AB, no HR : ts(4) + 8×ch(32)               = 36 bytes
+#   Slot AB + HR   : ts(4) + 8×ch(32) + hr(4)+peak(4) = 44 bytes
+PPG_VALID_SIZES = frozenset({20, 28, 36, 44})
+
+# struct format strings for each payload size.
+# HR field is float32; all other fields (ts, channels, peak) are uint32.
+_PPG_STRUCT_FMT: dict[int, str] = {
+    20: "<5I",    # ts + 4ch
+    28: "<5IfI",  # ts + 4ch + hr(float) + peak
+    36: "<9I",    # ts + 8ch
+    44: "<9IfI",  # ts + 8ch + hr(float) + peak
+}
+
+# Number of ADC channels per payload size (excludes timestamp, HR, Peak)
+PPG_N_CHANNELS: dict[int, int] = {20: 4, 28: 4, 36: 8, 44: 8}
+
+LIVE_CHUNK_BYTES = 240  # ~10 complete framed Slot-A samples per read
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -321,6 +338,12 @@ def _parse_frames(buf: bytearray, log: list[str]) -> tuple[list[tuple], bytearra
     Returns (samples, remaining_buf, raw_payload_bytes).
     Stray bytes before any frame header are logged and discarded.
     Unknown stream types are logged and skipped.
+
+    Decoded sample tuples vary by payload size:
+      20 bytes → (ts_ms, ch1, ch2, ch3, ch4)
+      28 bytes → (ts_ms, ch1, ch2, ch3, ch4, hr_bpm, peak)   # hr is float32
+      36 bytes → (ts_ms, ch1..ch8)
+      44 bytes → (ts_ms, ch1..ch8, hr_bpm, peak)              # hr is float32
     """
     samples: list[tuple] = []
     raw_payloads = bytearray()
@@ -354,11 +377,16 @@ def _parse_frames(buf: bytearray, log: list[str]) -> tuple[list[tuple], bytearra
         del buf[:total_frame]
 
         if frame_type == STREAM_TYPE_PPG:
-            if payload_len != PPG_PAYLOAD_SIZE:
-                log.append(f"[warn] PPG frame has unexpected payload len {payload_len}, expected {PPG_PAYLOAD_SIZE} — skipped")
+            if payload_len not in PPG_VALID_SIZES:
+                log.append(
+                    f"[warn] PPG frame unexpected payload len {payload_len} "
+                    f"(valid: {sorted(PPG_VALID_SIZES)}) — skipped"
+                )
                 continue
-            vals = struct.unpack("<5I", payload)
-            samples.append(vals)          # (ts_ms, ch1, ch2, ch3, ch4)
+            # Unpack using the format for this payload size.
+            # HR field is float32; all others are uint32.
+            vals = struct.unpack(_PPG_STRUCT_FMT[payload_len], payload)
+            samples.append(vals)
             raw_payloads.extend(payload)
         else:
             log.append(f"[warn] unknown stream type 0x{frame_type:02X}, len={payload_len} — skipped")
@@ -402,8 +430,10 @@ def receive_binary_stream(
     num_samples: int,
     stream_timeout_s: float = 30.0,
     progress_cb=None,
+    slot: str = "slota",
+    hr_channel: str | None = None,
 ) -> StreamResult:
-    """Send ``adpd ppg stream-bin <num_samples>`` and parse the binary response.
+    """Send ``adpd ppg <slot> stream-bin <num_samples>`` and parse the binary response.
 
     Uses framed binary protocol (magic + type + len + payload) so any stray
     shell text before or between frames is automatically skipped.
@@ -420,21 +450,35 @@ def receive_binary_stream(
         Total seconds to allow for the entire stream.
     progress_cb:
         Optional callable(received_count: int, total: int).
+    slot:
+        ``"slota"`` (4 ch, 20-byte frames) or ``"slotab"`` (8 ch, 36-byte frames).
+    hr_channel:
+        If set (e.g. ``"sAch3"``), appends ``hr on <channel>`` to the command so
+        the firmware DSP pipeline runs and adds HR + Peak fields to each frame
+        (+8 bytes: float32 BPM + uint32 peak flag).
 
     Returns
     -------
-    StreamResult with ``.samples`` as a list of (timestamp_ms, ch1, ch2, ch3, ch4).
+    StreamResult with ``.samples`` as a list of variable-length tuples.
+    Tuple layout depends on slot/HR:
+      (ts_ms, ch1..ch4)                  — Slot A, no HR
+      (ts_ms, ch1..ch4, hr_bpm, peak)    — Slot A + HR
+      (ts_ms, ch1..ch8)                  — Slot AB, no HR
+      (ts_ms, ch1..ch8, hr_bpm, peak)    — Slot AB + HR
     """
     if not SERIAL_AVAILABLE:
         return StreamResult(error="pyserial not installed")
 
     result = StreamResult()
+    # Build command string — slot prefix is required; hr suffix is optional
+    hr_suffix = f" hr on {hr_channel}" if hr_channel else ""
+    cmd_str   = f"adpd ppg {slot} stream-bin {num_samples}{hr_suffix}"
 
     try:
         ser = _open(port, baud, timeout=stream_timeout_s)
         ser.reset_input_buffer()
 
-        cmd = f"adpd ppg stream-bin {num_samples}\r\n"
+        cmd = cmd_str + "\r\n"
         ser.write(cmd.encode())
         ser.flush()
         result.log.append(f">> {cmd.strip()}")
@@ -490,29 +534,42 @@ def stream_binary_live(
     num_samples: int,
     chunk_bytes: int = LIVE_CHUNK_BYTES,
     stream_timeout_s: float = 30.0,
+    slot: str = "slota",
+    hr_channel: str | None = None,
 ):
     """Generator: yields parsed sample chunks as they arrive for live display.
 
     Each yield is ``(new_samples, new_raw_bytes, new_log_lines, is_final)``:
-    - ``new_samples``:   list of ``(timestamp_ms, ch1, ch2, ch3, ch4)`` tuples
+    - ``new_samples``:   list of variable-length tuples (see receive_binary_stream)
     - ``new_raw_bytes``: verbatim payload bytes for those samples
     - ``new_log_lines``: protocol/sync log lines since the last yield
     - ``is_final``:      True on the last yield (done or error)
 
     Log lines starting with ``ERROR:`` indicate a failure.
     Stray bytes before/between frames are logged as ``[sync]`` lines.
+
+    Parameters
+    ----------
+    slot:
+        ``"slota"`` (4-channel, 20-byte frames) or ``"slotab"`` (8-channel, 36-byte frames).
+    hr_channel:
+        Optional channel spec (e.g. ``"sAch3"``); appends ``hr on <ch>`` to the
+        command, adding HR BPM (float32) and Peak flag (uint32) to each frame.
     """
     if not SERIAL_AVAILABLE:
         yield [], b"", ["ERROR: pyserial not installed"], True
         return
 
     log: list[str] = []
+    # Build the command — slot prefix required, HR suffix optional
+    hr_suffix = f" hr on {hr_channel}" if hr_channel else ""
+    cmd_str   = f"adpd ppg {slot} stream-bin {num_samples}{hr_suffix}"
 
     try:
         ser = _open(port, baud, timeout=stream_timeout_s)
         ser.reset_input_buffer()
 
-        cmd = f"adpd ppg stream-bin {num_samples}\r\n"
+        cmd = cmd_str + "\r\n"
         ser.write(cmd.encode())
         ser.flush()
         log.append(f">> {cmd.strip()}")
