@@ -343,7 +343,17 @@ def receive_binary_stream(
             result.error = "Start marker not received — is the device connected and running?"
             return result
 
-        # Read the binary payload: num_samples × 16 bytes
+        # Drain any trailing text (e.g. shell prompt "> ") that may arrive between
+        # the start marker and the binary payload.  Read with a short timeout and
+        # stop as soon as the buffer is quiet — a real binary byte arriving would
+        # be the 0x00-0xFF range, never a lone printable-text sequence.
+        ser.timeout = 0.05
+        leftover = ser.read(64)
+        if leftover:
+            result.log.append(f"[drain] discarded {len(leftover)} pre-payload bytes: {leftover!r}")
+        ser.timeout = stream_timeout_s
+
+        # Read the binary payload: num_samples × BYTES_PER_SAMPLE bytes
         total_bytes = num_samples * BYTES_PER_SAMPLE
         buf = bytearray()
         while len(buf) < total_bytes and time.monotonic() < deadline:
@@ -434,6 +444,13 @@ def stream_binary_live(
             ser.close()
             yield [], b"", log + ["ERROR: Start marker not received — is the device connected?"], True
             return
+
+        # Drain any pre-payload bytes (e.g. shell prompt "> " printed before binary data)
+        ser.timeout = 0.05
+        leftover = ser.read(64)
+        if leftover:
+            log.append(f"[drain] discarded {len(leftover)} pre-payload bytes: {leftover!r}")
+        ser.timeout = stream_timeout_s
 
         # First yield: just the start-marker log, no samples yet
         yield [], b"", log, False
