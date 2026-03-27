@@ -7,7 +7,9 @@ The `adpd ppg stream-bin <count>` command streams raw PPG sensor data in binary 
 The command automatically starts PPG at the configured output data rate (ODR), streams the requested number of samples, then stops PPG. For text-based streaming with timestamps, use `adpd ppg stream <count>` instead.
 
 **Key features:**
-- **Efficient**: 20 bytes per sample vs. ~50+ bytes in text mode
+- **Efficient**: ~20-44 bytes per sample vs. ~50-150 bytes in text mode
+- **Dynamic**: Support for Slot A (4 ch) or Slot AB (8 ch) via command mask
+- **Integrated DSP**: Stream calculated Heart Rate and Peak flag alongside raw data
 - **Real-time**: No buffering delays, direct FIFO to serial
 - **Flexible ODR**: Configure sampling rate (10–400 Hz) before streaming
 - **Timestamped**: Millisecond precision timestamps from MCU clock
@@ -35,8 +37,7 @@ Current ODR Setting: 100 Hz
 
 ### Streaming at Default Frequency (100 Hz)
 ```bash
-# Stream 500 samples at 100 Hz (~5 seconds)
-> adpd ppg stream-bin 500
+> adpd ppg slota stream-bin 500
 [BIN] Starting binary stream: 500 samples (timestamp + 4 channels)
 [BIN] Stream complete: 500 samples (10000 bytes) sent
 ```
@@ -71,16 +72,21 @@ Current ODR Setting: 50 Hz
 
 ### Binary Layout (Per Sample)
 
-```
-[Timestamp: 4 bytes] [Ch1: 4 bytes] [Ch2: 4 bytes] [Ch3: 4 bytes] [Ch4: 4 bytes]
+**Structure:** `[Timestamp: 4][Channels: 4*N][Optional: HR: 4][Optional: Peak: 4]`
 
-Each field (timestamp, all channels):
+```
+[Timestamp: 4 bytes] [Ch1: 4 bytes] ... [ChN: 4 bytes] [HR: 4 bytes] [Peak: 4 bytes]
+
+Each field (timestamp, channels, HR, peak):
 [Byte 0] [Byte 1] [Byte 2] [Byte 3]
    LSB     ...      ...      MSB
-= uint32_t value (little-endian)
+= uint32_t / float32 value (little-endian)
 ```
 
 **Timestamp:** Starts at 0 when stream begins, increments in milliseconds
+**Channels:** 4 channels (Slot A) or 8 channels (Slot AB)
+**HR:** BPM value (float32) — only sent if `hr on` is in the command
+**Peak:** Flag (0 or 1) — only sent if `hr on` is in the command
 
 ### Example
 
@@ -228,7 +234,10 @@ port.close()
 
 - Data immediately follows the start marker message
 - No gaps between samples (continuous stream)
-- Each sample is exactly 20 bytes: 4-byte timestamp + 16 bytes (4 channels × 4 bytes)
+- Payload length depends on configuration:
+  - **Slot A (4 ch)**: 20 bytes/sample
+  - **Slot AB (8 ch)**: 36 bytes/sample
+  - **HR Enabled**: Adds 8 bytes (Peak + BPM) to any slot mode
 - Timestamp is relative to stream start (first sample = 0 ms)
 - Handle text markers (start/end messages) before parsing binary data
 - Recommended: Discard first 1-2 samples if timing is critical (FIFO warm-up)
