@@ -2,11 +2,26 @@
 
 Protocol reference: BINARY_STREAMING.md
 
-Binary stream format
---------------------
-- Start marker (text): ``[BIN] Starting binary stream: N samples\\r\\n``
-- Payload: N × 4 bytes, each sample is one little-endian uint32_t
-- End marker (text):   ``\\r\\n[BIN] Stream complete: N samples sent\\r\\n``
+Binary frame format (STREAM_MODE_BIN)
+--------------------------------------
+Every sample is wrapped in a 4-byte frame header:
+
+    [0xAD][0x7E][type:1][len:1][payload: len bytes]
+
+- Magic 0xAD 0x7E  — sync word; receiver scans for this to re-sync after
+                     any stray text bytes (shell prompt, log lines, etc.)
+- type             — stream type: 0x01 = PPG
+- len              — payload byte count (20 for PPG)
+
+PPG payload (20 bytes, all little-endian uint32_t):
+    [timestamp_ms][ch1][ch2][ch3][ch4]
+    - timestamp_ms : ms from stream start (relative, first sample ≈ 0)
+    - ch1/ch2      : ambient channels
+    - ch3/ch4      : PPG signal (IN3 paired, LED1A/LED1B)
+
+Session markers (text lines, for logging only — parser does not depend on them):
+    Start: ``[BIN] Starting binary stream: N samples (ts_ms + 4 ch, framed)``
+    End:   ``[BIN] Stream complete: N samples (N*24 bytes) sent``
 
 This module is Streamlit-free so it can be reused in CLI scripts or tests.
 """
@@ -273,10 +288,113 @@ def send_command(
         return CommandResult(command=command, error=f"Unexpected error: {exc}")
 
 
-BYTES_PER_SAMPLE = 20   # 4-byte timestamp + 4 channels × 4 bytes
-CHANNELS = ("timestamp_ms", "ch1", "ch2", "ch3", "ch4")
-LIVE_CHUNK_BYTES = 200  # ~10 samples per UI update at 20 bytes/sample
+# ─────────────────────────────────────────────────────────────────────────────
+# Binary frame protocol constants  (must match stream_task.h)
+# ─────────────────────────────────────────────────────────────────────────────
 
+FRAME_MAGIC      = bytes([0xAD, 0x7E])   # sync word
+FRAME_OVERHEAD   = 4                      # magic[2] + type[1] + len[1]
+
+STREAM_TYPE_PPG  = 0x01
+PPG_PAYLOAD_SIZE = 20                     # ts_ms(4) + ch[0..3](16) little-endian uint32
+
+BYTES_PER_SAMPLE = PPG_PAYLOAD_SIZE       # convenience alias
+CHANNELS         = ("timestamp_ms", "ch1", "ch2", "ch3", "ch4")
+LIVE_CHUNK_BYTES = 240                    # ~10 complete framed PPG samples per read
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Internal: framed binary parser
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _scan_to_magic(buf: bytearray) -> int:
+    """Return index of first 0xAD 0x7E in buf, or -1 if not found."""
+    for i in range(len(buf) - 1):
+        if buf[i] == 0xAD and buf[i + 1] == 0x7E:
+            return i
+    return -1
+
+
+def _parse_frames(buf: bytearray, log: list[str]) -> tuple[list[tuple], bytearray, bytes]:
+    """Extract all complete frames from buf.
+
+    Returns (samples, remaining_buf, raw_payload_bytes).
+    Stray bytes before any frame header are logged and discarded.
+    Unknown stream types are logged and skipped.
+    """
+    samples: list[tuple] = []
+    raw_payloads = bytearray()
+
+    while True:
+        # Need at least FRAME_OVERHEAD bytes to read a header
+        if len(buf) < FRAME_OVERHEAD:
+            break
+
+        idx = _scan_to_magic(buf)
+        if idx == -1:
+            # No magic found — keep last byte in case it's the start of a magic word
+            if buf:
+                log.append(f"[sync] discarded {len(buf) - 1} non-frame bytes")
+            buf = buf[-1:]
+            break
+
+        if idx > 0:
+            log.append(f"[sync] skipped {idx} bytes before frame magic")
+            del buf[:idx]
+
+        # buf[0:2] = magic, buf[2] = type, buf[3] = len
+        frame_type = buf[2]
+        payload_len = buf[3]
+        total_frame = FRAME_OVERHEAD + payload_len
+
+        if len(buf) < total_frame:
+            break  # wait for more bytes
+
+        payload = bytes(buf[FRAME_OVERHEAD:total_frame])
+        del buf[:total_frame]
+
+        if frame_type == STREAM_TYPE_PPG:
+            if payload_len != PPG_PAYLOAD_SIZE:
+                log.append(f"[warn] PPG frame has unexpected payload len {payload_len}, expected {PPG_PAYLOAD_SIZE} — skipped")
+                continue
+            vals = struct.unpack("<5I", payload)
+            samples.append(vals)          # (ts_ms, ch1, ch2, ch3, ch4)
+            raw_payloads.extend(payload)
+        else:
+            log.append(f"[warn] unknown stream type 0x{frame_type:02X}, len={payload_len} — skipped")
+
+    return samples, buf, bytes(raw_payloads)
+
+
+def _wait_for_start_marker(ser, deadline: float, log: list[str]) -> bool:
+    """Read text lines until the binary stream start banner or deadline.
+
+    Returns True if the start marker was seen.
+    Stray text lines are appended to log.
+    """
+    while time.monotonic() < deadline:
+        line = _read_line(ser, timeout_s=1.0)
+        if line:
+            log.append(f"<< {line}")
+        if "[BIN] Starting binary stream" in line:
+            return True
+    return False
+
+
+def _read_end_marker(ser, log: list[str]) -> None:
+    """Best-effort: read text lines for up to 2 s looking for the end banner."""
+    end_deadline = time.monotonic() + 2.0
+    while time.monotonic() < end_deadline:
+        line = _read_line(ser, timeout_s=0.5)
+        if line:
+            log.append(f"<< {line}")
+        if "[BIN] Stream complete" in line:
+            break
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public streaming API
+# ─────────────────────────────────────────────────────────────────────────────
 
 def receive_binary_stream(
     port: str,
@@ -287,30 +405,25 @@ def receive_binary_stream(
 ) -> StreamResult:
     """Send ``adpd ppg stream-bin <num_samples>`` and parse the binary response.
 
-    Protocol (BINARY_STREAMING.md):
-    1. Text start marker:  ``[BIN] Starting binary stream: N samples (timestamp + 4 channels)``
-    2. Payload:            ``num_samples × 20`` bytes — 5 × little-endian uint32 per sample
-       - timestamp_ms: ms from stream start (first sample = 0)
-       - Ch1, Ch2: ambient
-       - Ch3, Ch4: PPG signal (IN3 paired)
-    3. Text end marker:    ``[BIN] Stream complete: N samples … sent``
+    Uses framed binary protocol (magic + type + len + payload) so any stray
+    shell text before or between frames is automatically skipped.
 
     Parameters
     ----------
     port:
-        Serial device path.
+        Serial device path (e.g. ``/dev/tty.usbmodem101``).
     baud:
-        Baud rate.
+        Baud rate (typically 115200).
     num_samples:
-        Number of samples to request and expect.
+        Number of PPG samples to request.
     stream_timeout_s:
         Total seconds to allow for the entire stream.
     progress_cb:
-        Optional callable(received: int, total: int) called periodically.
+        Optional callable(received_count: int, total: int).
 
     Returns
     -------
-    StreamResult with ``.samples`` as a list of (timestamp_ms, ch1, ch2, ch3, ch4) tuples.
+    StreamResult with ``.samples`` as a list of (timestamp_ms, ch1, ch2, ch3, ch4).
     """
     if not SERIAL_AVAILABLE:
         return StreamResult(error="pyserial not installed")
@@ -321,72 +434,46 @@ def receive_binary_stream(
         ser = _open(port, baud, timeout=stream_timeout_s)
         ser.reset_input_buffer()
 
-        # Send the streaming command
         cmd = f"adpd ppg stream-bin {num_samples}\r\n"
         ser.write(cmd.encode())
         ser.flush()
         result.log.append(f">> {cmd.strip()}")
 
-        # Wait for the text start marker
         deadline = time.monotonic() + stream_timeout_s
-        start_seen = False
-        while time.monotonic() < deadline:
-            line = _read_line(ser, timeout_s=1.0)
-            if line:
-                result.log.append(f"<< {line}")
-            if "[BIN] Starting binary stream" in line:
-                start_seen = True
-                break
 
-        if not start_seen:
+        if not _wait_for_start_marker(ser, deadline, result.log):
             ser.close()
             result.error = "Start marker not received — is the device connected and running?"
             return result
 
-        # Drain any trailing text (e.g. shell prompt "> ") that may arrive between
-        # the start marker and the binary payload.  Read with a short timeout and
-        # stop as soon as the buffer is quiet — a real binary byte arriving would
-        # be the 0x00-0xFF range, never a lone printable-text sequence.
-        ser.timeout = 0.05
-        leftover = ser.read(64)
-        if leftover:
-            result.log.append(f"[drain] discarded {len(leftover)} pre-payload bytes: {leftover!r}")
-        ser.timeout = stream_timeout_s
-
-        # Read the binary payload: num_samples × BYTES_PER_SAMPLE bytes
-        total_bytes = num_samples * BYTES_PER_SAMPLE
+        # Accumulate raw bytes and scan for frames
         buf = bytearray()
-        while len(buf) < total_bytes and time.monotonic() < deadline:
-            remaining = total_bytes - len(buf)
-            chunk = ser.read(min(remaining, 512))
-            if chunk:
-                buf.extend(chunk)
-                if progress_cb:
-                    progress_cb(len(buf) // BYTES_PER_SAMPLE, num_samples)
+        all_raw = bytearray()
 
-        if len(buf) < total_bytes:
-            result.log.append(f"Timeout: got {len(buf)}/{total_bytes} bytes")
+        while len(result.samples) < num_samples and time.monotonic() < deadline:
+            chunk = ser.read(min(512, LIVE_CHUNK_BYTES))
+            if not chunk:
+                continue
 
-        result.raw_bytes = bytes(buf)   # save verbatim before slicing
+            buf.extend(chunk)
+            new_samples, buf, raw_chunk = _parse_frames(buf, result.log)
+            result.samples.extend(new_samples)
+            all_raw.extend(raw_chunk)
 
-        # Parse: each 20-byte group → (timestamp_ms, ch1, ch2, ch3, ch4)
-        parsed = len(buf) // BYTES_PER_SAMPLE
-        raw = struct.unpack(f"<{parsed * 5}I", bytes(buf[:parsed * BYTES_PER_SAMPLE]))
-        result.samples = [
-            (raw[i * 5], raw[i * 5 + 1], raw[i * 5 + 2], raw[i * 5 + 3], raw[i * 5 + 4])
-            for i in range(parsed)
-        ]
-        result.log.append(f"Parsed {parsed} samples ({parsed * BYTES_PER_SAMPLE} bytes)")
+            if progress_cb:
+                progress_cb(len(result.samples), num_samples)
 
-        # Read trailing end marker (best-effort)
-        end_deadline = time.monotonic() + 2.0
-        while time.monotonic() < end_deadline:
-            line = _read_line(ser, timeout_s=0.5)
-            if line:
-                result.log.append(f"<< {line}")
-            if "[BIN] Stream complete" in line:
-                break
+        if len(result.samples) < num_samples:
+            result.log.append(
+                f"Timeout: got {len(result.samples)}/{num_samples} samples"
+            )
 
+        result.raw_bytes = bytes(all_raw)
+        result.log.append(
+            f"Parsed {len(result.samples)} samples ({len(all_raw)} payload bytes)"
+        )
+
+        _read_end_marker(ser, result.log)
         ser.close()
 
     except serial.SerialException as exc:
@@ -408,11 +495,12 @@ def stream_binary_live(
 
     Each yield is ``(new_samples, new_raw_bytes, new_log_lines, is_final)``:
     - ``new_samples``:   list of ``(timestamp_ms, ch1, ch2, ch3, ch4)`` tuples
-    - ``new_raw_bytes``: verbatim bytes for those samples
-    - ``new_log_lines``: protocol log lines since the last yield
+    - ``new_raw_bytes``: verbatim payload bytes for those samples
+    - ``new_log_lines``: protocol/sync log lines since the last yield
     - ``is_final``:      True on the last yield (done or error)
 
     Log lines starting with ``ERROR:`` indicate a failure.
+    Stray bytes before/between frames are logged as ``[sync]`` lines.
     """
     if not SERIAL_AVAILABLE:
         yield [], b"", ["ERROR: pyserial not installed"], True
@@ -429,77 +517,42 @@ def stream_binary_live(
         ser.flush()
         log.append(f">> {cmd.strip()}")
 
-        # Wait for start marker
         deadline = time.monotonic() + stream_timeout_s
-        start_seen = False
-        while time.monotonic() < deadline:
-            line = _read_line(ser, timeout_s=1.0)
-            if line:
-                log.append(f"<< {line}")
-            if "[BIN] Starting binary stream" in line:
-                start_seen = True
-                break
 
-        if not start_seen:
+        if not _wait_for_start_marker(ser, deadline, log):
             ser.close()
             yield [], b"", log + ["ERROR: Start marker not received — is the device connected?"], True
             return
 
-        # Drain any pre-payload bytes (e.g. shell prompt "> " printed before binary data)
-        ser.timeout = 0.05
-        leftover = ser.read(64)
-        if leftover:
-            log.append(f"[drain] discarded {len(leftover)} pre-payload bytes: {leftover!r}")
-        ser.timeout = stream_timeout_s
-
-        # First yield: just the start-marker log, no samples yet
+        # Yield start-marker log before any data
         yield [], b"", log, False
         log = []
 
-        total_bytes = num_samples * BYTES_PER_SAMPLE
-        received_bytes = 0
-        pending = bytearray()
+        buf = bytearray()
+        received = 0
 
-        while received_bytes < total_bytes and time.monotonic() < deadline:
-            want = min(chunk_bytes, total_bytes - received_bytes)
-            chunk = ser.read(want)
+        while received < num_samples and time.monotonic() < deadline:
+            chunk = ser.read(chunk_bytes)
             if not chunk:
                 continue
 
-            pending.extend(chunk)
-            received_bytes += len(chunk)
+            buf.extend(chunk)
+            new_samples, buf, raw_chunk = _parse_frames(buf, log)
 
-            # Only emit complete samples
-            complete = (len(pending) // BYTES_PER_SAMPLE) * BYTES_PER_SAMPLE
-            if complete == 0:
+            if not new_samples and not log:
                 continue
 
-            raw_chunk = bytes(pending[:complete])
-            pending = pending[complete:]
+            received += len(new_samples)
+            is_done = received >= num_samples
+            yield new_samples, raw_chunk, log, is_done
+            log = []
 
-            n = complete // BYTES_PER_SAMPLE
-            raw_vals = struct.unpack(f"<{n * 5}I", raw_chunk)
-            new_samples = [
-                (raw_vals[i * 5], raw_vals[i * 5 + 1],
-                 raw_vals[i * 5 + 2], raw_vals[i * 5 + 3], raw_vals[i * 5 + 4])
-                for i in range(n)
-            ]
-            is_done = received_bytes >= total_bytes
-            yield new_samples, raw_chunk, [], is_done
+        if received < num_samples:
+            log.append(f"Timeout: got {received}/{num_samples} samples")
 
-        if received_bytes < total_bytes:
-            log.append(f"Timeout: got {received_bytes}/{total_bytes} bytes")
-
-        # Read trailing end marker (best-effort)
-        end_deadline = time.monotonic() + 2.0
-        while time.monotonic() < end_deadline:
-            line = _read_line(ser, timeout_s=0.5)
-            if line:
-                log.append(f"<< {line}")
-            if "[BIN] Stream complete" in line:
-                break
-
+        _read_end_marker(ser, log)
         ser.close()
+
         if log:
             yield [], b"", log, True
 
