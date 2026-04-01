@@ -27,10 +27,18 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from ui.live_session import (
+    LIVE_ODR_KEY,
+    LIVE_SAMPLE_COUNT_KEY,
+    LIVE_SLOT_KEY,
+    get_live_capture_status,
+    launch_live_stream,
+    stop_live_session,
+)
 from usb_serial import (
-    SERIAL_AVAILABLE, list_serial_ports, describe_ports,
+    SERIAL_AVAILABLE, list_serial_ports, describe_ports, find_adpd7000_port_pair,
     find_port_owner, force_release_port, test_connection,
-    send_command, stream_binary_live,
+    send_command, stream_binary_live_dual_port,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -88,6 +96,37 @@ _CH_INFO = [
 # Supported ODR values for the ADPD7000 PPG freq command
 _ODR_OPTIONS = [10, 25, 50, 100, 200, 400]
 
+_DOC_COMMANDS = [
+    "help",
+    "help adpd",
+    "help adpd ppg",
+    "help eeprom",
+    "help rtos",
+    "reset",
+    "scan i2c",
+    "scan spi",
+    "rtos stats",
+    "eeprom info",
+    "eeprom test",
+    "adpd probe",
+    "adpd probe sdk",
+    "adpd read slota",
+    "adpd read slotab",
+    "adpd reset",
+    "adpd gpio read",
+    "adpd calib clk",
+    "adpd ppg list",
+    "adpd ppg slota show",
+    "adpd ppg slotab show",
+    "adpd ppg slota2 show",
+    "adpd ppg slota reset",
+    "adpd ppg slota start",
+    "adpd ppg slotab start",
+    "adpd ppg slota2 start",
+    "adpd ppg stop",
+    "adpd ppg freq",
+]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -105,7 +144,10 @@ def _log(msg: str, level: str = "info"):
 
 def render_serial_tab():
     st.markdown(_SERIAL_CSS, unsafe_allow_html=True)
-    st.header("USB Serial")
+    st.header("Connect Device")
+    st.caption(
+        "Pair the ADPD7000 control and stream ports here, run the live feed, then use expert shell and raw capture tools when needed."
+    )
 
     if not SERIAL_AVAILABLE:
         st.error("`pyserial` is not installed — `pip install pyserial`")
@@ -118,6 +160,8 @@ def render_serial_tab():
         return
 
     st.divider()
+    _render_live_analysis_feed()
+    st.divider()
     _render_command_console()
     st.divider()
     _render_binary_capture()
@@ -129,57 +173,95 @@ def render_serial_tab():
 
 def _render_connection_panel():
     is_connected = st.session_state.get("conn_connected", False)
-    active_port  = st.session_state.get("conn_port", "")
+    active_control = st.session_state.get("conn_control_port", st.session_state.get("conn_port", ""))
+    active_stream = st.session_state.get("conn_stream_port", "")
     active_baud  = st.session_state.get("conn_baud", 115200)
 
     ports = list_serial_ports()
+    detected_pair = find_adpd7000_port_pair()
     # Mirror detected ports to the browser console for USB debugging
     st.components.v1.html(
         f"<script>console.log('[USB] ports:', {ports});</script>", height=1
     )
 
-    pc1, pc2, pc3, pc4 = st.columns([3, 2, 1, 1])
+    st.subheader("1. Pair Ports")
+    pc1, pc2, pc3, pc4, pc5 = st.columns([3, 3, 2, 1, 1])
 
     with pc1:
         if ports:
-            # Pre-select the previously used port if it is still present
-            idx = ports.index(active_port) if active_port in ports else 0
-            port = st.selectbox("Port", ports, index=idx,
-                                key="tab_conn_port", disabled=is_connected)
+            default_control = detected_pair["control_port"] or active_control or ports[0]
+            idx = ports.index(default_control) if default_control in ports else 0
+            control_port = st.selectbox(
+                "Control Port", ports, index=idx, key="tab_conn_control", disabled=is_connected
+            )
         else:
-            # No ports enumerated — fall back to free-text entry
-            port = st.text_input("Port (manual)",
-                                 value=active_port or "/dev/tty.usbmodem101",
-                                 key="tab_conn_port_txt", disabled=is_connected)
+            control_port = st.text_input(
+                "Control Port (manual)",
+                value=active_control or detected_pair["control_port"] or "/dev/tty.usbmodem101",
+                key="tab_conn_control_txt",
+                disabled=is_connected,
+            )
 
     with pc2:
+        if ports:
+            fallback_stream = ports[1] if len(ports) > 1 else ports[0]
+            default_stream = detected_pair["stream_port"] or active_stream or fallback_stream
+            idx = ports.index(default_stream) if default_stream in ports else min(1, len(ports) - 1)
+            stream_port = st.selectbox(
+                "Stream Port", ports, index=idx, key="tab_conn_stream", disabled=is_connected
+            )
+        else:
+            stream_port = st.text_input(
+                "Stream Port (manual)",
+                value=active_stream or detected_pair["stream_port"] or "/dev/tty.usbmodem102",
+                key="tab_conn_stream_txt",
+                disabled=is_connected,
+            )
+
+    with pc3:
         baud_opts = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
         baud_idx  = baud_opts.index(active_baud) if active_baud in baud_opts else 4
         baud = st.selectbox("Baud", baud_opts, index=baud_idx,
                             key="tab_conn_baud", disabled=is_connected)
 
-    with pc3:
+    with pc4:
         if not is_connected:
             if st.button("Connect", type="primary", width="stretch", key="tab_conn_btn"):
-                with st.spinner(f"Connecting to {port}…"):
-                    chk = test_connection(port, baud)
-                if chk.ok:
-                    # Write shared conn_* keys — sidebar status panel reads these
-                    st.session_state.update(conn_connected=True, conn_port=port, conn_baud=baud)
-                    st.session_state.pop("_tab_conn_err", None)
-                    _log(f"Connected — {port} @ {baud}", "ok")
+                if not control_port or not stream_port:
+                    st.session_state["_tab_conn_err"] = "Select both a control port and a stream port."
+                elif control_port == stream_port:
+                    st.session_state["_tab_conn_err"] = "Control port and stream port must be different."
                 else:
-                    st.session_state["_tab_conn_err"] = chk.error or "Connection failed"
-                    _log(f"Connect failed: {chk.error}", "error")
+                    with st.spinner(f"Connecting to {control_port} / {stream_port}…"):
+                        chk_control = test_connection(control_port, baud)
+                        chk_stream = test_connection(stream_port, baud)
+                    if chk_control.ok and chk_stream.ok:
+                        st.session_state.update(
+                            conn_connected=True,
+                            conn_port=control_port,
+                            conn_control_port=control_port,
+                            conn_stream_port=stream_port,
+                            conn_baud=baud,
+                        )
+                        st.session_state.pop("_tab_conn_err", None)
+                        _log(f"Connected — control {control_port} / stream {stream_port} @ {baud}", "ok")
+                    else:
+                        err = chk_control.error if not chk_control.ok else chk_stream.error
+                        st.session_state["_tab_conn_err"] = err or "Connection failed"
+                        _log(f"Connect failed: {err}", "error")
                 st.rerun()
         else:
             if st.button("Disconnect", type="secondary", width="stretch", key="tab_disconn_btn"):
+                stop_live_session()
                 st.session_state["conn_connected"] = False
+                st.session_state["conn_port"] = ""
+                st.session_state["conn_control_port"] = ""
+                st.session_state["conn_stream_port"] = ""
                 st.session_state.pop("_tab_conn_err", None)
-                _log(f"Disconnected from {active_port}", "info")
+                _log(f"Disconnected from control {active_control} / stream {active_stream}", "info")
                 st.rerun()
 
-    with pc4:
+    with pc5:
         if st.button("Refresh", width="stretch", key="tab_refresh_btn", disabled=is_connected):
             st.rerun()
 
@@ -187,31 +269,45 @@ def _render_connection_panel():
     last_err = st.session_state.get("_tab_conn_err", "")
     if is_connected:
         desc_map = {p["device"]: p["description"] for p in describe_ports()}
-        st.success(f"Connected — **{active_port}** @ {active_baud}  |  {desc_map.get(active_port, active_port)}")
+        st.success(
+            f"Connected — control **{active_control}** ({desc_map.get(active_control, active_control)})"
+            f" · stream **{active_stream}** ({desc_map.get(active_stream, active_stream)})"
+            f" · {active_baud} baud"
+        )
     else:
         if last_err and "PORT_BUSY" in last_err:
-            # Port is held by another process — offer a force-release path
-            owner = find_port_owner(port)
+            busy_port = control_port
+            owner = find_port_owner(busy_port)
             owner_s = f"held by **{owner[1]}** (PID {owner[0]})" if owner else "owner unknown"
-            st.error(f"Port busy — {owner_s}")
+            st.error(f"Port busy — {busy_port} {owner_s}")
             fc1, fc2 = st.columns([3, 1])
             fc1.caption("Another process has the port open. Force-disconnect terminates it and reconnects.")
             with fc2:
                 if st.button("Force & Reconnect", type="primary", width="stretch", key="tab_force_btn"):
                     with st.spinner("Releasing port…"):
-                        rel = force_release_port(port)
+                        rel = force_release_port(busy_port)
                     if rel.ok:
                         _log(f"Force release: {rel.response}", "warn")
-                        # Brief pause to let the OS reclaim the port before retrying
                         time.sleep(0.5)
-                        chk2 = test_connection(port, baud)
-                        if chk2.ok:
-                            st.session_state.update(conn_connected=True, conn_port=port, conn_baud=baud)
+                        chk2_control = test_connection(control_port, baud)
+                        chk2_stream = test_connection(stream_port, baud)
+                        if chk2_control.ok and chk2_stream.ok:
+                            st.session_state.update(
+                                conn_connected=True,
+                                conn_port=control_port,
+                                conn_control_port=control_port,
+                                conn_stream_port=stream_port,
+                                conn_baud=baud,
+                            )
                             st.session_state.pop("_tab_conn_err", None)
-                            _log(f"Reconnected after force release — {port} @ {baud}", "ok")
+                            _log(
+                                f"Reconnected after force release — control {control_port} / stream {stream_port} @ {baud}",
+                                "ok",
+                            )
                         else:
-                            st.session_state["_tab_conn_err"] = chk2.error or ""
-                            _log(f"Reconnect failed: {chk2.error}", "error")
+                            err = chk2_control.error if not chk2_control.ok else chk2_stream.error
+                            st.session_state["_tab_conn_err"] = err or ""
+                            _log(f"Reconnect failed: {err}", "error")
                     else:
                         _log(f"Force release failed: {rel.error}", "error")
                         st.session_state["_tab_conn_err"] = f"FORCE_FAILED: {rel.error}"
@@ -221,8 +317,10 @@ def _render_connection_panel():
         else:
             if ports:
                 desc_map = {p["device"]: p["description"] for p in describe_ports()}
-                if port in desc_map:
-                    st.caption(f"Device: {desc_map[port]}")
+                if control_port in desc_map:
+                    st.caption(f"Control device: {desc_map[control_port]}")
+                if stream_port in desc_map:
+                    st.caption(f"Stream device: {desc_map[stream_port]}")
             st.warning("Not connected — select a port and click Connect.")
 
     # ── Connection log (collapsed by default) ─────────────────────────────────
@@ -251,7 +349,7 @@ def _send(cmd: str):
     next render — without the rerun Streamlit's top-to-bottom pass would
     render the terminal *before* the button handler fires, leaving it stale.
     """
-    port    = st.session_state.get("conn_port", "")
+    port    = st.session_state.get("conn_control_port", st.session_state.get("conn_port", ""))
     baud    = st.session_state.get("conn_baud", 115200)
     timeout = st.session_state.get("serial_resp_timeout", 3.0)
     ts      = datetime.datetime.now().strftime("%H:%M:%S")
@@ -275,6 +373,88 @@ def _send(cmd: str):
 
     # Rerun so the terminal panel reflects the new entry immediately
     st.rerun()
+
+
+def _render_live_analysis_feed():
+    status = get_live_capture_status()
+    control_port = st.session_state.get("conn_control_port", st.session_state.get("conn_port", ""))
+    stream_port = st.session_state.get("conn_stream_port", "")
+    baud = st.session_state.get("conn_baud", 115200)
+    is_streaming = st.session_state.get("live_streaming", False)
+
+    st.subheader("2. Feed Live Analysis")
+    st.caption(
+        "This is the only place that starts or stops the live feed used by the analysis dashboard."
+    )
+
+    head1, head2, head3, head4 = st.columns(4)
+    head1.metric("State", status["title"])
+    head2.metric("Slot", status["slot"])
+    head3.metric("ODR", f"{status['odr_hz']} Hz")
+    head4.metric("Captured", f"{status['sample_count']:,}/{status['requested_samples']:,}")
+
+    if status["phase"] == "streaming":
+        st.progress(status["progress_ratio"], text=status["detail"])
+
+    cfg1, cfg2, cfg3 = st.columns([2, 2, 2])
+    with cfg1:
+        st.radio(
+            "Live slot",
+            ["slota", "slotab"],
+            horizontal=True,
+            key=LIVE_SLOT_KEY,
+            disabled=is_streaming,
+        )
+    with cfg2:
+        st.select_slider(
+            "ODR (Hz)",
+            options=_ODR_OPTIONS,
+            value=st.session_state.get(LIVE_ODR_KEY, 100),
+            key=LIVE_ODR_KEY,
+            disabled=is_streaming,
+        )
+    with cfg3:
+        st.number_input(
+            "Samples",
+            min_value=100,
+            max_value=100_000,
+            value=int(st.session_state.get(LIVE_SAMPLE_COUNT_KEY, 10_000)),
+            step=500,
+            key=LIVE_SAMPLE_COUNT_KEY,
+            disabled=is_streaming,
+        )
+
+    act1, act2 = st.columns([2, 1])
+    with act1:
+        if st.button("Start live feed", type="primary", width="stretch", disabled=is_streaming):
+            odr = st.session_state.get(LIVE_ODR_KEY, 100)
+            send_command(control_port, baud, f"adpd ppg freq {odr}", response_timeout_s=2.0)
+            launch_live_stream(
+                st.session_state,
+                control_port=control_port,
+                stream_port=stream_port,
+                baud=baud,
+                num_samples=int(st.session_state.get(LIVE_SAMPLE_COUNT_KEY, 10_000)),
+                slot=st.session_state.get(LIVE_SLOT_KEY, "slota"),
+            )
+            _log(
+                f"Live feed start: control {control_port} / stream {stream_port} @ {odr} Hz",
+                "info",
+            )
+            st.rerun()
+    with act2:
+        if st.button("Stop live feed", width="stretch", disabled=not is_streaming):
+            stop_live_session()
+            _log("Live feed stop requested", "warn")
+            st.rerun()
+
+    if status["tone"] == "error":
+        st.error(status["detail"])
+    elif status["tone"] == "success":
+        st.success(status["detail"])
+    else:
+        st.info(status["detail"])
+    st.caption(status["action_hint"])
 
 
 def _sec(label: str):
@@ -521,7 +701,8 @@ def _render_terminal_panel():
 
 
 def _render_command_console():
-    st.subheader("Command Console")
+    st.subheader("3. Run Shell Commands")
+    st.caption("Use the curated command palette for common tasks, or fall back to a raw command when needed.")
 
     # Two-column layout: terminal output on the left, command palette on the right
     col_term, col_palette = st.columns([2, 3])
@@ -539,55 +720,51 @@ def _render_command_console():
         )
 
         # ─────────────────────────────────────────────────────────────────────
-        # SYSTEM — board-level utility commands
+        # UTILITIES — board-level shell helpers and quick status commands
         # ─────────────────────────────────────────────────────────────────────
-        _sec("System")
+        _sec("Explore")
         _btn_row([
             ("help",       "help"),
+            ("help adpd",  "help adpd"),
+            ("help ppg",   "help adpd ppg"),
+            ("help eeprom","help eeprom"),
+            ("help rtos",  "help rtos"),
             ("reset",      "reset"),
             ("rtos stats", "rtos stats"),  # RTOS task state, priority, stack HWM
             ("scan i2c",   "scan i2c"),
             ("scan spi",   "scan spi"),
-        ], "sys", n_cols=4)
+        ], "explore", n_cols=4)
 
         # ─────────────────────────────────────────────────────────────────────
-        # PPG CONTROL — start/stop streaming and ODR/sample-count configuration
+        # PPG PROFILES — inspect and reset the mutable in-RAM profile set
         # ─────────────────────────────────────────────────────────────────────
-        _sec("PPG Control")
+        _sec("PPG Profiles")
+        _btn_row([
+            ("ppg list",     "adpd ppg list"),
+            ("slota show",   "adpd ppg slota show"),
+            ("slotab show",  "adpd ppg slotab show"),
+            ("slota2 show",  "adpd ppg slota2 show"),
+            ("slota reset",  "adpd ppg slota reset"),
+        ], "ppg_profiles", n_cols=4)
 
-        # Slot selector — drives the prefix for freq/stream/stream-bin commands.
-        # slota = 4-channel (Ch1–4); slotab = 8-channel (Ch1–4 + Ch5–8).
-        slot = st.radio(
-            "Slot", ["slota", "slotab"], horizontal=True,
-            key="ppg_slot_sel",
-            help="slota = 4 channels (Slot A only) · slotab = 8 channels (Slot A + B)",
-        )
-
-        # Start buttons always show both slot variants; stop needs no slot prefix
+        # ─────────────────────────────────────────────────────────────────────
+        # PPG START & CAPTURE — probe, set ODR, start, and stream
+        # ─────────────────────────────────────────────────────────────────────
+        _sec("PPG Start & Capture")
         _btn_row([
             ("slota start", "adpd ppg slota start"),
             ("slotab start", "adpd ppg slotab start"),
+            ("slota2 start", "adpd ppg slota2 start"),
             ("stop",         "adpd ppg stop"),
         ], "ppg_ctrl", n_cols=4)
 
-        # ODR — query current setting (no arg) or set a new value.
-        # freq has no slot prefix per firmware docs; applies globally.
-        _btn_row([("freq?", "adpd ppg freq")], "ppg_freq_q", n_cols=4)
         _form_row_1("f_ppg_freq", "adpd ppg freq",
                     placeholder="", select_opts=_ODR_OPTIONS, select_default=100)
 
-        # ASCII text stream — N samples, human-readable CSV over serial.
-        # Optional HR column: appends `hr on <ch>` when a channel is selected.
-        _form_ppg_stream(f"f_ppg_stream_{slot}",     slot, binary=False)
-
-        # Binary framed stream — N × 20-byte frames (ts + ch1–4 uint32 LE).
-        # Same HR option; use for high-speed capture and offline analysis.
-        _form_ppg_stream(f"f_ppg_stream_bin_{slot}", slot, binary=True)
-
         # ─────────────────────────────────────────────────────────────────────
-        # ADPD DEVICE — register access, GPIO, calibration
+        # SENSOR DIAGNOSTICS — register access, GPIO, and calibration helpers
         # ─────────────────────────────────────────────────────────────────────
-        _sec("ADPD Device")
+        _sec("Probe & Inspect")
         # Probe + diagnostic template reads (slota and slotab now both supported)
         _btn_row([
             ("probe",        "adpd probe"),       # SPI comms check — expects chip ID 0x01C6
@@ -619,9 +796,9 @@ def _render_command_console():
                     ph1="idx  0-2", ph2="mode  e.g. 2", ph3="out_sel  e.g. 0x17")
 
         # ─────────────────────────────────────────────────────────────────────
-        # INTERFACE — enable/disable USB and UART physical interfaces
+        # TRANSPORT — enable/disable USB and UART physical interfaces
         # ─────────────────────────────────────────────────────────────────────
-        _sec("Interface")
+        _sec("Interfaces")
         _btn_row([
             ("usb on",    "interface usb on"),
             ("usb off",   "interface usb off"),
@@ -630,9 +807,9 @@ def _render_command_console():
         ], "iface", n_cols=4)
 
         # ─────────────────────────────────────────────────────────────────────
-        # EEPROM — non-volatile storage read/write for calibration data
+        # STORAGE — non-volatile storage read/write for calibration data
         # ─────────────────────────────────────────────────────────────────────
-        _sec("EEPROM")
+        _sec("Storage & Bus")
         _btn_row([
             ("info", "eeprom info"),
             ("test", "eeprom test"),
@@ -660,15 +837,17 @@ def _render_command_console():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _render_binary_capture():
-    active_port = st.session_state.get("conn_port", "")
+    active_control = st.session_state.get("conn_control_port", st.session_state.get("conn_port", ""))
+    active_stream = st.session_state.get("conn_stream_port", "")
     active_baud = st.session_state.get("conn_baud", 115200)
 
-    st.subheader("Binary Stream Capture")
+    st.subheader("4. Capture Raw Stream")
     st.caption(
-        "Sends `adpd ppg <slot> stream-bin N [hr on <ch>]` — "
+        "Sends `adpd ppg <slot> stream-bin N [hr on <ch>]` on the control port and reads framed data from the stream port — "
         "Slot A: 20 bytes/frame · Slot AB: 36 bytes/frame · +HR: +8 bytes.  "
         "Ch3/Ch4 = PPG · Ch1/Ch2 = ambient."
     )
+    st.caption(f"Control: `{active_control or '—'}`  |  Stream: `{active_stream or '—'}`")
 
     bs1, bs2, bs3 = st.columns([2, 2, 1])
     with bs1:
@@ -685,8 +864,8 @@ def _render_binary_capture():
     bs4, bs5 = st.columns([2, 3])
     with bs4:
         cap_slot = st.radio(
-            "Slot", ["slota", "slotab"], horizontal=True, key="capture_slot",
-            help="slota = 4 ch (20 B/frame) · slotab = 8 ch (36 B/frame)",
+            "Slot", ["slota", "slotab", "slota2"], horizontal=True, key="capture_slot",
+            help="slota/slota2 = 4 ch (20 B/frame) · slotab = 8 ch (36 B/frame)",
         )
     with bs5:
         hr_opts = ["— no HR", "sAch1", "sAch2", "sAch3", "sAch4"]
@@ -716,7 +895,7 @@ def _render_binary_capture():
         _log("Capture stopped by user", "warn")
 
     if capture_btn and not is_capturing:
-        _start_capture(active_port, active_baud, int(n_samples),
+        _start_capture(active_control, active_stream, active_baud, int(n_samples),
                        float(stream_timeout), live_mode, cap_slot, hr_channel)
         st.rerun()
 
@@ -790,7 +969,7 @@ def _render_binary_capture():
             st.rerun()
 
 
-def _start_capture(port, baud, n_samples, timeout_s, live_mode,
+def _start_capture(control_port, stream_port, baud, n_samples, timeout_s, live_mode,
                    slot: str = "slota", hr_channel: str | None = None):
     """Kick off the binary stream worker in a daemon thread.
 
@@ -798,7 +977,7 @@ def _start_capture(port, baud, n_samples, timeout_s, live_mode,
     to buf/raw/log and sets done=True on exit.  The Streamlit fragment polls
     this dict every 0.5 s via run_every.
 
-    slot and hr_channel are forwarded to stream_binary_live so the correct
+    slot and hr_channel are forwarded to stream_binary_live_dual_port so the correct
     command is sent (e.g. ``adpd ppg slotab stream-bin 500 hr on sBch3``).
     """
     stop_ev = threading.Event()
@@ -810,8 +989,8 @@ def _start_capture(port, baud, n_samples, timeout_s, live_mode,
 
     def _worker():
         try:
-            for new_s, new_raw, new_log, _ in stream_binary_live(
-                port, baud, n_samples, stream_timeout_s=timeout_s,
+            for new_s, new_raw, new_log, _ in stream_binary_live_dual_port(
+                control_port, stream_port, baud, n_samples, stream_timeout_s=timeout_s,
                 slot=slot, hr_channel=hr_channel,
             ):
                 if stop_ev.is_set():
@@ -832,8 +1011,11 @@ def _start_capture(port, baud, n_samples, timeout_s, live_mode,
             shared["done"] = True
 
     threading.Thread(target=_worker, daemon=True).start()
-    _log(f"Capture start: {n_samples} samples from {port} "
-         f"({'live' if live_mode else 'batch'})", "info")
+    _log(
+        f"Capture start: {n_samples} samples via control {control_port} / stream {stream_port} "
+        f"({'live' if live_mode else 'batch'})",
+        "info",
+    )
 
 
 def _render_capture_chart(buf: list, key: str):

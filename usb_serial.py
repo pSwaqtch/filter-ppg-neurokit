@@ -2,26 +2,27 @@
 
 Protocol reference: BINARY_STREAMING.md
 
-Binary frame format (STREAM_MODE_BIN)
---------------------------------------
-Every sample is wrapped in a 4-byte frame header:
+Binary frame format
+-------------------
+Frames use the shared USB protocol envelope:
 
-    [0xAD][0x7E][type:1][len:1][payload: len bytes]
+    [0xA5][0x5A][version][type][flags][seq_lo][seq_hi][len_lo][len_hi]
+    [payload...][crc_lo][crc_hi]
 
-- Magic 0xAD 0x7E  — sync word; receiver scans for this to re-sync after
-                     any stray text bytes (shell prompt, log lines, etc.)
-- type             — stream type: 0x01 = PPG
-- len              — payload byte count (20 for PPG)
+- magic            — sync word; receiver scans for this to re-sync after any
+                      stray bytes
+- version          — protocol version (currently 0x01)
+- type             — stream message type (0xA0 for PPG streaming)
+- flags            — currently reserved
+- sequence         — little-endian frame sequence number
+- payload_len      — little-endian payload byte count
+- crc16            — CRC-16/CCITT over [version..payload], little-endian
 
-PPG payload (20 bytes, all little-endian uint32_t):
-    [timestamp_ms][ch1][ch2][ch3][ch4]
-    - timestamp_ms : ms from stream start (relative, first sample ≈ 0)
-    - ch1/ch2      : ambient channels
-    - ch3/ch4      : PPG signal (IN3 paired, LED1A/LED1B)
-
-Session markers (text lines, for logging only — parser does not depend on them):
-    Start: ``[BIN] Starting binary stream: N samples (ts_ms + 4 ch, framed)``
-    End:   ``[BIN] Stream complete: N samples (N*24 bytes) sent``
+PPG payload sizes supported here:
+    20 bytes  — Slot A, no HR
+    28 bytes  — Slot A, HR enabled
+    36 bytes  — Slot AB, no HR
+    44 bytes  — Slot AB, HR enabled
 
 This module is Streamlit-free so it can be reused in CLI scripts or tests.
 """
@@ -75,6 +76,24 @@ def describe_ports() -> list[dict]:
     except Exception as e:
         print(f"[ERROR] describe_ports failed: {type(e).__name__}: {e}")
         return []
+
+
+def find_port_by_description(description_substring: str) -> str:
+    """Return the first port whose description contains the given text."""
+    needle = description_substring.lower()
+    for port in describe_ports():
+        description = str(port.get("description", "")).lower()
+        if needle in description:
+            return str(port.get("device", ""))
+    return ""
+
+
+def find_adpd7000_port_pair() -> dict[str, str]:
+    """Best-effort auto-detection of the ADPD7000 control/stream port pair."""
+    return {
+        "control_port": find_port_by_description("adpd7000 control"),
+        "stream_port": find_port_by_description("adpd7000 stream"),
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -290,23 +309,21 @@ def send_command(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Binary frame protocol constants  (must match stream_task.h)
+# Binary frame protocol constants  (must match the documented USB envelope)
 # ─────────────────────────────────────────────────────────────────────────────
 
-FRAME_MAGIC    = bytes([0xAD, 0x7E])   # sync word
-FRAME_OVERHEAD = 4                      # magic[2] + type[1] + len[1]
+FRAME_MAGIC = bytes([0xA5, 0x5A])      # sync word
+FRAME_VERSION = 0x01
+FRAME_TYPE_PPG = 0xA0
+STREAM_TYPE_PPG = FRAME_TYPE_PPG       # compatibility alias
+FRAME_HEADER_SIZE = 9                  # magic[2] + version/type/flags/seq/len
+FRAME_TRAILER_SIZE = 2                 # crc16
+FRAME_OVERHEAD = FRAME_HEADER_SIZE + FRAME_TRAILER_SIZE
 
-STREAM_TYPE_PPG = 0x01
-
-# Valid PPG payload sizes — determined by slot config and HR flag:
-#   Slot A, no HR  : ts(4) + 4×ch(16)               = 20 bytes
-#   Slot A + HR    : ts(4) + 4×ch(16) + hr(4)+peak(4) = 28 bytes
-#   Slot AB, no HR : ts(4) + 8×ch(32)               = 36 bytes
-#   Slot AB + HR   : ts(4) + 8×ch(32) + hr(4)+peak(4) = 44 bytes
 PPG_VALID_SIZES = frozenset({20, 28, 36, 44})
 
-# struct format strings for each payload size.
-# HR field is float32; all other fields (ts, channels, peak) are uint32.
+# Struct format strings for each payload size.
+# HR field is float32; all other fields (timestamp, channels, peak) are uint32.
 _PPG_STRUCT_FMT: dict[int, str] = {
     20: "<5I",    # ts + 4ch
     28: "<5IfI",  # ts + 4ch + hr(float) + peak
@@ -324,12 +341,31 @@ LIVE_CHUNK_BYTES = 240  # ~10 complete framed Slot-A samples per read
 # Internal: framed binary parser
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _crc16_ccitt(data: bytes) -> int:
+    """Return CRC-16/CCITT-FALSE for *data*."""
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return crc
+
+
 def _scan_to_magic(buf: bytearray) -> int:
-    """Return index of first 0xAD 0x7E in buf, or -1 if not found."""
-    for i in range(len(buf) - 1):
-        if buf[i] == 0xAD and buf[i + 1] == 0x7E:
-            return i
-    return -1
+    """Return index of first magic word in *buf*, or -1 if not found."""
+    return buf.find(FRAME_MAGIC)
+
+
+def _decode_ppg_payload(payload: bytes) -> tuple:
+    """Decode a PPG payload into a tuple of integers/floats."""
+    payload_len = len(payload)
+    fmt = _PPG_STRUCT_FMT.get(payload_len)
+    if fmt is None:
+        raise ValueError(f"unexpected PPG payload length {payload_len}")
+    return struct.unpack(fmt, payload)
 
 
 def _parse_frames(buf: bytearray, log: list[str]) -> tuple[list[tuple], bytearray, bytes]:
@@ -349,75 +385,76 @@ def _parse_frames(buf: bytearray, log: list[str]) -> tuple[list[tuple], bytearra
     raw_payloads = bytearray()
 
     while True:
-        # Need at least FRAME_OVERHEAD bytes to read a header
-        if len(buf) < FRAME_OVERHEAD:
-            break
-
         idx = _scan_to_magic(buf)
         if idx == -1:
-            # No magic found — keep last byte in case it's the start of a magic word
             if buf:
-                log.append(f"[sync] discarded {len(buf) - 1} non-frame bytes")
-            buf = buf[-1:]
+                keep = 1 if buf[-1] == FRAME_MAGIC[0] else 0
+                discarded = len(buf) - keep
+                if discarded:
+                    log.append(f"[sync] discarded {discarded} non-frame bytes")
+                if keep:
+                    buf[:] = buf[-1:]
+                else:
+                    buf.clear()
             break
 
         if idx > 0:
             log.append(f"[sync] skipped {idx} bytes before frame magic")
             del buf[:idx]
 
-        # buf[0:2] = magic, buf[2] = type, buf[3] = len
-        frame_type = buf[2]
-        payload_len = buf[3]
-        total_frame = FRAME_OVERHEAD + payload_len
+        if len(buf) < FRAME_HEADER_SIZE:
+            break  # wait for more bytes
+
+        version = buf[2]
+        frame_type = buf[3]
+        flags = buf[4]
+        seq_lo = buf[5]
+        seq_hi = buf[6]
+        payload_len = buf[7] | (buf[8] << 8)
+        total_frame = FRAME_HEADER_SIZE + payload_len + FRAME_TRAILER_SIZE
 
         if len(buf) < total_frame:
             break  # wait for more bytes
 
-        payload = bytes(buf[FRAME_OVERHEAD:total_frame])
+        payload = bytes(buf[FRAME_HEADER_SIZE:FRAME_HEADER_SIZE + payload_len])
+        crc_rx = buf[FRAME_HEADER_SIZE + payload_len] | (buf[FRAME_HEADER_SIZE + payload_len + 1] << 8)
+        crc_calc = _crc16_ccitt(bytes(buf[2:FRAME_HEADER_SIZE]) + payload)
+
         del buf[:total_frame]
 
-        if frame_type == STREAM_TYPE_PPG:
-            if payload_len not in PPG_VALID_SIZES:
-                log.append(
-                    f"[warn] PPG frame unexpected payload len {payload_len} "
-                    f"(valid: {sorted(PPG_VALID_SIZES)}) — skipped"
-                )
-                continue
-            # Unpack using the format for this payload size.
-            # HR field is float32; all others are uint32.
-            vals = struct.unpack(_PPG_STRUCT_FMT[payload_len], payload)
-            samples.append(vals)
-            raw_payloads.extend(payload)
-        else:
+        if version != FRAME_VERSION:
+            log.append(f"[warn] unsupported frame version 0x{version:02X} — skipped")
+            continue
+
+        if frame_type != FRAME_TYPE_PPG:
             log.append(f"[warn] unknown stream type 0x{frame_type:02X}, len={payload_len} — skipped")
+            continue
+
+        if payload_len not in PPG_VALID_SIZES:
+            log.append(
+                f"[warn] PPG frame unexpected payload len {payload_len} "
+                f"(valid: {sorted(PPG_VALID_SIZES)}) — skipped"
+            )
+            continue
+
+        if crc_rx != crc_calc:
+            seq = seq_lo | (seq_hi << 8)
+            log.append(
+                f"[warn] bad CRC for seq=0x{seq:04X} "
+                f"(rx=0x{crc_rx:04X}, calc=0x{crc_calc:04X}) — skipped"
+            )
+            continue
+
+        try:
+            vals = _decode_ppg_payload(payload)
+        except ValueError as exc:
+            log.append(f"[warn] {exc} — skipped")
+            continue
+
+        samples.append(vals)
+        raw_payloads.extend(payload)
 
     return samples, buf, bytes(raw_payloads)
-
-
-def _wait_for_start_marker(ser, deadline: float, log: list[str]) -> bool:
-    """Read text lines until the binary stream start banner or deadline.
-
-    Returns True if the start marker was seen.
-    Stray text lines are appended to log.
-    """
-    while time.monotonic() < deadline:
-        line = _read_line(ser, timeout_s=1.0)
-        if line:
-            log.append(f"<< {line}")
-        if "[BIN] Starting binary stream" in line:
-            return True
-    return False
-
-
-def _read_end_marker(ser, log: list[str]) -> None:
-    """Best-effort: read text lines for up to 2 s looking for the end banner."""
-    end_deadline = time.monotonic() + 2.0
-    while time.monotonic() < end_deadline:
-        line = _read_line(ser, timeout_s=0.5)
-        if line:
-            log.append(f"<< {line}")
-        if "[BIN] Stream complete" in line:
-            break
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -435,8 +472,8 @@ def receive_binary_stream(
 ) -> StreamResult:
     """Send ``adpd ppg <slot> stream-bin <num_samples>`` and parse the binary response.
 
-    Uses framed binary protocol (magic + type + len + payload) so any stray
-    shell text before or between frames is automatically skipped.
+    Uses the framed binary protocol so any stray bytes before or between frames
+    are automatically skipped.
 
     Parameters
     ----------
@@ -451,7 +488,7 @@ def receive_binary_stream(
     progress_cb:
         Optional callable(received_count: int, total: int).
     slot:
-        ``"slota"`` (4 ch, 20-byte frames) or ``"slotab"`` (8 ch, 36-byte frames).
+        ``"slota"`` (4 ch, 20/28-byte frames) or ``"slotab"`` (8 ch, 36/44-byte frames).
     hr_channel:
         If set (e.g. ``"sAch3"``), appends ``hr on <channel>`` to the command so
         the firmware DSP pipeline runs and adds HR + Peak fields to each frame
@@ -472,7 +509,7 @@ def receive_binary_stream(
     result = StreamResult()
     # Build command string — slot prefix is required; hr suffix is optional
     hr_suffix = f" hr on {hr_channel}" if hr_channel else ""
-    cmd_str   = f"adpd ppg {slot} stream-bin {num_samples}{hr_suffix}"
+    cmd_str = f"adpd ppg {slot} stream-bin {num_samples}{hr_suffix}"
 
     try:
         ser = _open(port, baud, timeout=stream_timeout_s)
@@ -484,11 +521,6 @@ def receive_binary_stream(
         result.log.append(f">> {cmd.strip()}")
 
         deadline = time.monotonic() + stream_timeout_s
-
-        if not _wait_for_start_marker(ser, deadline, result.log):
-            ser.close()
-            result.error = "Start marker not received — is the device connected and running?"
-            return result
 
         # Accumulate raw bytes and scan for frames
         buf = bytearray()
@@ -516,8 +548,6 @@ def receive_binary_stream(
         result.log.append(
             f"Parsed {len(result.samples)} samples ({len(all_raw)} payload bytes)"
         )
-
-        _read_end_marker(ser, result.log)
         ser.close()
 
     except serial.SerialException as exc:
@@ -551,7 +581,7 @@ def stream_binary_live(
     Parameters
     ----------
     slot:
-        ``"slota"`` (4-channel, 20-byte frames) or ``"slotab"`` (8-channel, 36-byte frames).
+        ``"slota"`` (4-channel, 20/28-byte frames) or ``"slotab"`` (8-channel, 36/44-byte frames).
     hr_channel:
         Optional channel spec (e.g. ``"sAch3"``); appends ``hr on <ch>`` to the
         command, adding HR BPM (float32) and Peak flag (uint32) to each frame.
@@ -563,7 +593,7 @@ def stream_binary_live(
     log: list[str] = []
     # Build the command — slot prefix required, HR suffix optional
     hr_suffix = f" hr on {hr_channel}" if hr_channel else ""
-    cmd_str   = f"adpd ppg {slot} stream-bin {num_samples}{hr_suffix}"
+    cmd_str = f"adpd ppg {slot} stream-bin {num_samples}{hr_suffix}"
 
     try:
         ser = _open(port, baud, timeout=stream_timeout_s)
@@ -576,12 +606,6 @@ def stream_binary_live(
 
         deadline = time.monotonic() + stream_timeout_s
 
-        if not _wait_for_start_marker(ser, deadline, log):
-            ser.close()
-            yield [], b"", log + ["ERROR: Start marker not received — is the device connected?"], True
-            return
-
-        # Yield start-marker log before any data
         yield [], b"", log, False
         log = []
 
@@ -606,9 +630,79 @@ def stream_binary_live(
 
         if received < num_samples:
             log.append(f"Timeout: got {received}/{num_samples} samples")
-
-        _read_end_marker(ser, log)
         ser.close()
+
+        if log:
+            yield [], b"", log, True
+
+    except serial.SerialException as exc:
+        yield [], b"", [f"ERROR: {exc}"], True
+    except Exception as exc:
+        yield [], b"", [f"ERROR: Unexpected: {exc}"], True
+
+
+def stream_binary_live_dual_port(
+    control_port: str,
+    stream_port: str,
+    baud: int,
+    num_samples: int,
+    chunk_bytes: int = LIVE_CHUNK_BYTES,
+    stream_timeout_s: float = 30.0,
+    slot: str = "slota",
+    hr_channel: str | None = None,
+):
+    """Generator: start capture on the control port and read frames from the stream port."""
+    if not SERIAL_AVAILABLE:
+        yield [], b"", ["ERROR: pyserial not installed"], True
+        return
+
+    if not control_port or not stream_port:
+        yield [], b"", ["ERROR: Both control and stream ports are required"], True
+        return
+
+    if control_port == stream_port:
+        yield [], b"", ["ERROR: Control port and stream port must be different"], True
+        return
+
+    log: list[str] = []
+    hr_suffix = f" hr on {hr_channel}" if hr_channel else ""
+    cmd_str = f"adpd ppg {slot} stream-bin {num_samples}{hr_suffix}"
+
+    try:
+        ctrl = _open(control_port, baud, timeout=2.0)
+        stream = _open(stream_port, baud, timeout=stream_timeout_s)
+        ctrl.reset_input_buffer()
+        stream.reset_input_buffer()
+
+        ctrl.write((cmd_str + "\r\n").encode())
+        ctrl.flush()
+        log.append(f">> [{control_port}] {cmd_str}")
+        yield [], b"", log, False
+        log = []
+
+        deadline = time.monotonic() + stream_timeout_s
+        buf = bytearray()
+        received = 0
+
+        while received < num_samples and time.monotonic() < deadline:
+            chunk = stream.read(chunk_bytes)
+            if not chunk:
+                continue
+
+            buf.extend(chunk)
+            new_samples, buf, raw_chunk = _parse_frames(buf, log)
+            if not new_samples and not log:
+                continue
+
+            received += len(new_samples)
+            yield new_samples, raw_chunk, log, received >= num_samples
+            log = []
+
+        if received < num_samples:
+            log.append(f"Timeout: got {received}/{num_samples} samples")
+
+        ctrl.close()
+        stream.close()
 
         if log:
             yield [], b"", log, True

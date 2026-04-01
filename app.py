@@ -38,10 +38,18 @@ st.components.v1.html(
 # Page config
 # ─────────────────────────────────────────────────────────────────────────────
 
-st.set_page_config(page_title="PPG Filter & Analysis", layout="wide")
-st.title("PPG Signal Filter & Analysis")
+st.set_page_config(page_title="PPG Workbench", layout="wide")
+st.title("PPG Workbench")
+st.caption(
+    "Use the app in three steps: pair the device, start or load a signal, then inspect the analysis views."
+)
 
-_tab_analysis, _tab_serial = st.tabs(["Analysis", "USB Serial"])
+wf1, wf2, wf3 = st.columns(3)
+wf1.info("**1. Connect Device**\n\nPair the ADPD7000 control and stream ports in `Connect Device`.")
+wf2.info("**2. Choose Signal Source**\n\nLoad a demo/uploaded recording or switch to the live device stream.")
+wf3.info("**3. Review Analysis**\n\nInspect signal quality, peaks, beats, HRV, and exports in one place.")
+
+_tab_serial, _tab_analysis = st.tabs(["Connect Device", "Analyze Signal"])
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sidebar  (all controls — data source, channel, transform, SR, methods)
@@ -164,8 +172,8 @@ else:
 # Tabs
 # ─────────────────────────────────────────────────────────────────────────────
 
-with _tab_analysis:
-    render_analysis_tab(sidebar_cfg, pipeline_ctx)
-
 with _tab_serial:
     render_serial_tab()
+
+with _tab_analysis:
+    render_analysis_tab(sidebar_cfg, pipeline_ctx)

@@ -26,6 +26,19 @@ from ppg_processing import (
 from ppg_charts import plot_raw_signal, plot_cleaned_overlay, plot_peaks, plot_individual_beats, plot_quality
 from ui.cache import cached_pipeline, cached_epochs
 from ui.helpers import extract_box_x
+from ui.live_session import (
+    LIVE_CHANNEL_KEY,
+    LIVE_COMPUTED_SR_KEY,
+    LIVE_FINALISED_KEY,
+    LIVE_MANUAL_SR_KEY,
+    LIVE_OVERRIDE_SR_KEY,
+    LIVE_STREAMING_KEY,
+    LiveSample,
+    ensure_live_session_state,
+    get_live_capture_status,
+    get_live_shared_state,
+    set_live_computed_sr,
+)
 
 _LIVE_DISPLAY_S = 15.0
 _CHART_H        = 290  # chart height in px for the 2-column grid
@@ -89,9 +102,23 @@ def render_analysis_tab(sidebar_cfg: dict, pipeline_ctx: dict):
                    its own context from the stream buffer.
     """
     st.markdown(_DASH_CSS, unsafe_allow_html=True)
+    ensure_live_session_state()
 
     live = sidebar_cfg["live_stream_mode"]
-    live_refresh = 0.5 if st.session_state.get("live_streaming") and live else None
+    st.subheader("Signal Analysis")
+    if live:
+        status = get_live_capture_status()
+        st.caption(
+            "This dashboard reads the shared live buffer. Start or stop the live feed from `Connect Device`."
+        )
+        stat1, stat2, stat3, stat4 = st.columns(4)
+        stat1.metric("Live state", status["title"])
+        stat2.metric("Control port", status["control_port"] or "—")
+        stat3.metric("Stream port", status["stream_port"] or "—")
+        stat4.metric("Target", f"{status['slot']} @ {status['odr_hz']} Hz")
+    else:
+        st.caption("This dashboard is analyzing the selected recording window.")
+    live_refresh = 0.5 if st.session_state.get(LIVE_STREAMING_KEY) and live else None
 
     @st.fragment(run_every=live_refresh)
     def _dashboard(_scfg=sidebar_cfg, _pctx=pipeline_ctx):
@@ -119,14 +146,14 @@ def render_analysis_tab(sidebar_cfg: dict, pipeline_ctx: dict):
 def _build_live_context(scfg: dict) -> dict | None:
     """Build analysis context from the rolling live stream buffer.
     Returns None when there is no data yet or a terminal error."""
-    shared    = st.session_state.get("_sshared_live", {})
-    buf       = shared.get("buf", [])
-    done      = shared.get("done", False)
-    streaming = st.session_state.get("live_streaming", False)
-    error     = shared.get("error")
+    shared = get_live_shared_state()
+    buf = shared.get("buf", [])
+    done = shared.get("done", False)
+    streaming = st.session_state.get(LIVE_STREAMING_KEY, False)
+    error = shared.get("error")
 
     if done and streaming:
-        st.session_state["live_streaming"] = False
+        st.session_state[LIVE_STREAMING_KEY] = False
         streaming = False
 
     if error:
@@ -134,18 +161,24 @@ def _build_live_context(scfg: dict) -> dict | None:
 
     if not buf:
         msg = "Streaming… waiting for first samples." if streaming else \
-              "No stream data yet. Select **USB Serial Stream**, connect, and press ▶ Start."
+              "No live samples yet. Pair the device and start the live feed from `Connect Device`."
         st.info(msg)
-        if done and not st.session_state.get("_live_finalised"):
-            st.session_state["_live_finalised"] = True
+        if done and not st.session_state.get(LIVE_FINALISED_KEY):
+            st.session_state[LIVE_FINALISED_KEY] = True
             st.rerun()
         return None
 
-    # Build arrays from buffer
-    all_ts  = np.array([s[0] for s in buf], dtype=np.float64)
-    ch_key  = st.session_state.get("live_channel", "ch3")
-    ch_idx  = {"ch1": 1, "ch2": 2, "ch3": 3, "ch4": 4}[ch_key]
-    all_sig = np.array([s[ch_idx] for s in buf], dtype=np.float64)
+    all_ts = np.array([sample.timestamp_ms for sample in buf], dtype=np.float64)
+    first_sample: LiveSample = buf[0]
+    available_channels = first_sample.channel_names
+    ch_key = st.session_state.get(
+        LIVE_CHANNEL_KEY,
+        available_channels[min(2, len(available_channels) - 1)],
+    )
+    if ch_key not in available_channels:
+        ch_key = available_channels[0]
+        st.session_state[LIVE_CHANNEL_KEY] = ch_key
+    all_sig = np.array([sample.channel_map[ch_key] for sample in buf], dtype=np.float64)
 
     # Rolling SR from last 200 timestamps
     win = min(len(all_ts), 200)
@@ -156,9 +189,9 @@ def _build_live_context(scfg: dict) -> dict | None:
     else:
         sr = 100.0
 
-    if st.session_state.get("live_override_sr"):
-        sr = float(st.session_state.get("live_manual_sr", sr))
-    st.session_state["_live_computed_sr"] = sr
+    if st.session_state.get(LIVE_OVERRIDE_SR_KEY):
+        sr = float(st.session_state.get(LIVE_MANUAL_SR_KEY, sr))
+    set_live_computed_sr(st.session_state, sr)
 
     # Display window
     keep_n   = max(10, int(_LIVE_DISPLAY_S * sr))
@@ -197,8 +230,8 @@ def _build_live_context(scfg: dict) -> dict | None:
     peaks           = results["info"].get("PPG_Peaks", np.array([], dtype=int))
     hr_m, hr_lo, hr_hi = compute_hr_metrics(peaks, sr)
 
-    if done and not streaming and not st.session_state.get("_live_finalised"):
-        st.session_state["_live_finalised"] = True
+    if done and not streaming and not st.session_state.get(LIVE_FINALISED_KEY):
+        st.session_state[LIVE_FINALISED_KEY] = True
         st.rerun()
 
     return {
@@ -220,10 +253,11 @@ def _build_live_context(scfg: dict) -> dict | None:
         "t0":        float(ts_w[0]),
         "t1":        float(ts_w[-1]),
         "n_rows":    len(buf),
-        "n_cols":    5,
+        "n_cols":    len(available_channels) + 1,
         "df_raw":    None,
         "sig_bytes": sig_w.tobytes(),
         "streaming": streaming,
+        "live_df":   pd.DataFrame([sample.to_row() for sample in buf]),
     }
 
 
@@ -407,25 +441,23 @@ def _render_dashboard(ctx: dict, scfg: dict,
         with st.expander(f"Raw data preview — {ctx['n_rows']:,} rows"):
             st.dataframe(ctx["df_raw"].head(200), use_container_width=True)
     elif live:
-        shared_p = st.session_state.get("_sshared_live", {})
-        buf_p    = shared_p.get("buf", [])
+        shared_p = get_live_shared_state()
+        buf_p = shared_p.get("buf", [])
         if buf_p:
             with st.expander(f"Stream buffer preview — {len(buf_p):,} samples"):
-                preview = pd.DataFrame(buf_p[-200:],
-                                       columns=["timestamp_ms", "ch1", "ch2", "ch3", "ch4"])
+                preview = pd.DataFrame([sample.to_row() for sample in buf_p[-200:]])
                 st.dataframe(preview, use_container_width=True)
 
     # ── Export ────────────────────────────────────────────────────────────────
     export_df = _build_export_df(ctx, clean_method, peak_method, quality_methods, live)
 
     if live:
-        shared_ex = st.session_state.get("_sshared_live", {})
-        buf_ex    = shared_ex.get("buf", [])
-        raw_ex    = shared_ex.get("raw", b"")
+        shared_ex = get_live_shared_state()
+        buf_ex = shared_ex.get("buf", [])
+        raw_ex = shared_ex.get("raw", b"")
         if buf_ex:
             with st.expander("Export stream data"):
-                fdf = pd.DataFrame(buf_ex,
-                                   columns=["timestamp_ms", "ch1", "ch2", "ch3", "ch4"])
+                fdf = pd.DataFrame([sample.to_row() for sample in buf_ex])
                 e1, e2, e3 = st.columns(3)
                 with e1:
                     st.download_button(
@@ -450,8 +482,9 @@ def _render_dashboard(ctx: dict, scfg: dict,
                         help=f"{len(raw_ex):,} bytes — 20 bytes/sample",
                     )
                 if st.button("Clear stream data", key="live_clear_btn"):
-                    for k in ("_sshared_live", "_live_finalised", "_live_computed_sr"):
-                        st.session_state.pop(k, None)
+                    st.session_state.pop(LIVE_FINALISED_KEY, None)
+                    st.session_state.pop(LIVE_COMPUTED_SR_KEY, None)
+                    st.session_state.pop("_sshared_live", None)
                     st.rerun()
     else:
         with st.expander("Export"):
