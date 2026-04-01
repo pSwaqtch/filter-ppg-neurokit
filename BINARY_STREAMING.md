@@ -1,244 +1,231 @@
-# Binary Streaming Protocol
+# Binary Streaming
 
-## Overview
+This document describes the current framed telemetry protocol used on the `ADPD7000 Stream Port`.
 
-The `adpd ppg stream-bin <count>` command streams raw PPG sensor data in binary format over USB/UART. This provides efficient data transmission for high-speed logging without text encoding overhead.
+The binary stream is emitted on the dedicated CDC data interface only.
 
-The command automatically starts PPG at the configured output data rate (ODR), streams the requested number of samples, then stops PPG. For text-based streaming with timestamps, use `adpd ppg stream <count>` instead.
+## 1. Port Model
 
-**Key features:**
-- **Efficient**: ~20-44 bytes per sample vs. ~50-150 bytes in text mode
-- **Dynamic**: Support for Slot A (4 ch) or Slot AB (8 ch) via command mask
-- **Integrated DSP**: Stream calculated Heart Rate and Peak flag alongside raw data
-- **Real-time**: No buffering delays, direct FIFO to serial
-- **Flexible ODR**: Configure sampling rate (10–400 Hz) before streaming
-- **Timestamped**: Millisecond precision timestamps from MCU clock
+The firmware uses two CDC ports:
 
----
+- `ADPD7000 Control Port`
+  Text shell, command input, help, diagnostics
+- `ADPD7000 Stream Port`
+  Framed binary telemetry
 
-## Quick Start
+You start streaming from the control port, but you read sample frames from the stream port.
 
-### Setup (one-time)
-```bash
-# Terminal: Connect to device at 115200 baud
-screen /dev/ttyUSB0 115200
-# or: miniterm.py /dev/ttyUSB0 115200
+## 2. Start a Stream
 
-# Probe chip to verify SPI communication
-> adpd probe
-[SUCCESS] ID: 0x01C6
+Issue the command on the control port:
 
-# Check chip configuration
-> adpd read slota
---- GLOBAL & SLOT A CONFIGURATION (100 Hz PPG) ---
-...
+```text
+adpd ppg slota stream-bin 1000
 ```
 
-### Streaming at Default Frequency (100 Hz)
-```bash
-> adpd ppg slota stream-bin 500
-[BIN] Starting binary stream: 500 samples (timestamp + 4 channels)
-[BIN] Stream complete: 500 samples (10000 bytes) sent
+Or:
+
+```text
+adpd ppg slotab stream-bin 200
+adpd ppg slota2 stream-bin 500
 ```
 
-### Custom Frequency (e.g., 50 Hz)
-```bash
-# Set output data rate to 50 Hz
-> adpd ppg freq 50
-ODR set to 50 Hz (will take effect on next PPG start)
+The firmware then emits framed telemetry on the stream port.
 
-# Stream 1000 samples at 50 Hz (~20 seconds)
-> adpd ppg stream-bin 1000
-[BIN] Starting binary stream: 1000 samples
-[BIN] Stream complete: 1000 samples (20000 bytes) sent
+## 3. Frame Envelope
 
-# Verify the ODR change
-> adpd diag
-Current ODR Setting: 50 Hz
-...
+Binary frames use the shared USB protocol envelope defined in `usb_proto`.
+
+Layout:
+
+```text
+[magic0][magic1][version][type][flags][seq_lo][seq_hi][len_lo][len_hi][payload...][crc_lo][crc_hi]
 ```
 
----
+Field sizes:
 
-## Stream Format
+- `magic0`: 1 byte
+- `magic1`: 1 byte
+- `version`: 1 byte
+- `type`: 1 byte
+- `flags`: 1 byte
+- `sequence`: 2 bytes, little-endian
+- `payload_len`: 2 bytes, little-endian
+- `payload`: variable
+- `crc16`: 2 bytes, little-endian
 
-**Per sample:** 20 bytes (timestamp + 4 channels)
-- **Timestamp:** 4 bytes (uint32_t, milliseconds from stream start)
-- **Channels:** 4 channels × 4 bytes each
+Constants:
 
-**Byte order:** Little-endian (LSB first) per uint32_t value
-**Data rate:** ~100 Hz with 20-byte samples = ~2 KB/sec
+- `magic0 = 0xA5`
+- `magic1 = 0x5A`
+- `version = 0x01`
+- `type = 0xA0` for `USB_PROTO_MSG_STREAM_PPG`
 
-### Binary Layout (Per Sample)
+CRC:
 
-**Structure:** `[Timestamp: 4][Channels: 4*N][Optional: HR: 4][Optional: Peak: 4]`
+- CRC-16/CCITT
+- computed over `[version .. payload]`
+- excludes the two sync bytes
 
-```
-[Timestamp: 4 bytes] [Ch1: 4 bytes] ... [ChN: 4 bytes] [HR: 4 bytes] [Peak: 4 bytes]
+## 4. PPG Payload
 
-Each field (timestamp, channels, HR, peak):
-[Byte 0] [Byte 1] [Byte 2] [Byte 3]
-   LSB     ...      ...      MSB
-= uint32_t / float32 value (little-endian)
-```
+Current PPG payload body:
 
-**Timestamp:** Starts at 0 when stream begins, increments in milliseconds
-**Channels:** 4 channels (Slot A) or 8 channels (Slot AB)
-**HR:** BPM value (float32) — only sent if `hr on` is in the command
-**Peak:** Flag (0 or 1) — only sent if `hr on` is in the command
-
-### Example
-
-Sample with timestamp 1234 ms and channel values:
-- Timestamp: `0x000004D2` (1234 in decimal)
-- Ch1: `0xAABBCCDD`
-- Ch2: `0x11223344`
-- Ch3: `0x55667788`
-- Ch4: `0x99AABBCC`
-
-Transmitted bytes (20 total):
-```
-Timestamp:  D2 04 00 00
-Channel 1:  DD CC BB AA
-Channel 2:  44 33 22 11
-Channel 3:  88 77 66 55
-Channel 4:  CC BB AA 99
+```text
+[timestamp_ms:4][channel_0:4][channel_1:4]...[channel_n:4][optional_hr:4][optional_peak:4]
 ```
 
-Reconstruction (little-endian):
-```python
-# For each 4-byte chunk:
-value = byte[0] | (byte[1] << 8) | (byte[2] << 16) | (byte[3] << 24)
+Encoding:
+
+- all integer fields are little-endian
+- timestamp is relative to stream start
+- each channel sample is `uint32_t`
+- HR, when present, is raw `float32`
+- Peak, when present, is `uint32_t` with `0` or `1`
+
+Payload sizes:
+
+- Slot A, no HR: `4 + 4*4 = 20` bytes
+- Slot A, HR enabled: `28` bytes
+- Slot AB, no HR: `4 + 8*4 = 36` bytes
+- Slot AB, HR enabled: `44` bytes
+- Slot A2 depends on configured channel count and HR mode
+
+## 5. Example Frame
+
+Example payload for Slot A without HR:
+
+- timestamp = `1234 ms`
+- ch1 = `0x11223344`
+- ch2 = `0x55667788`
+- ch3 = `0x99AABBCC`
+- ch4 = `0xDDEEFF00`
+
+Payload bytes:
+
+```text
+D2 04 00 00
+44 33 22 11
+88 77 66 55
+CC BB AA 99
+00 FF EE DD
 ```
 
-## Protocol Markers
+The full frame on the wire is:
 
-**Start (after `adpd ppg stream-bin <count>`):**
-```
-[BIN] Starting binary stream: N samples (timestamp + 4 channels)\r\n
-```
-(Text message, not binary)
-
-**End:**
-```
-\r\n[BIN] Stream complete: N samples (80 bytes) sent\r\n
-```
-(Text message, not binary — 80 bytes = 4 samples × 20 bytes per sample, unless N is different)
-
-## Transmission Notes
-
-- No packet framing: raw 20-byte chunks stream continuously
-- No checksums or sequence numbers
-- 1 timestamp + 4 channel uint32_t values = 20 bytes per complete sample
-- Timestamp starts at 0 ms, incremented per sample based on system time
-- Timing controlled by FIFO polling (10 ms delay between reads → ~100 Hz)
-- Data integrity depends on USB/UART link stability
-- Channels are IN3 paired for PPG (Ch3/Ch4) with Ch1/Ch2 showing ambient
-
-## Python Parser Example
-
-```python
-import struct
-import sys
-
-def parse_binary_stream(data, num_samples):
-    """Parse binary stream into (timestamp_ms, ch1, ch2, ch3, ch4) tuples"""
-    samples = []
-    for i in range(num_samples):
-        offset = i * 20  # 20 bytes per sample (timestamp + 4 channels × 4 bytes)
-        if offset + 20 <= len(data):
-            # Unpack timestamp + 4 little-endian uint32 values
-            ts, ch1, ch2, ch3, ch4 = struct.unpack('<IIIII', data[offset:offset+20])
-            samples.append((ts, ch1, ch2, ch3, ch4))
-    return samples
-
-# Usage:
-# with open('stream.bin', 'rb') as f:
-#     data = f.read()
-# samples = parse_binary_stream(data, count)
-# for ts, ch1, ch2, ch3, ch4 in samples:
-#     print(f"T={ts}ms: Ch1={ch1}, Ch2={ch2}, Ch3={ch3}, Ch4={ch4}")
+```text
+A5 5A 01 A0 00 <seq_lo> <seq_hi> 14 00 <payload 20 bytes> <crc_lo> <crc_hi>
 ```
 
-## Supported Output Data Rates (ODR)
+`0x0014` is the payload length for the 20-byte Slot A case.
 
-Available sampling frequencies (all are 4-channel, 16-bit signals):
+## 6. Parsing Notes
 
-| ODR (Hz) | Period (ms) | Use Case |
-|----------|-------------|----------|
-| 10 | 100 | Low-power, stationary monitoring |
-| 25 | 40 | Battery-constrained devices |
-| 50 | 20 | Standard wrist-worn PPG |
-| **100** | **10** | **Default; most common PPG use** |
-| 200 | 5 | High-fidelity analysis, research |
-| 400 | 2.5 | High-speed data capture, artifact detection |
+Host parser requirements:
 
-**Set ODR before starting stream:**
-```bash
-> adpd ppg freq 200
-ODR set to 200 Hz (will take effect on next PPG start)
-> adpd ppg stream-bin 5000
-```
+- search for `0xA5 0x5A`
+- read fixed header
+- validate version
+- read payload length
+- read payload and CRC
+- verify CRC-16/CCITT
+- decode payload according to current stream mode
 
-## USB vs UART Performance
+Do not assume line breaks or text markers on the stream port.
 
-| Interface | Bandwidth | Throughput (20 bytes/sample) |
-|-----------|-----------|------------------------------|
-| USB FS (12 Mbps) | 12 Mbps | ~60,000 samples/sec |
-| UART 115200 | 115.2 kbps | ~1,440 samples/sec |
+## 7. Python Skeleton
 
-**Current implementation:** Streams at selected ODR (10–400 Hz = 200–8,000 bytes/sec), well below both limits.
-- **USB**: Ideal for research/development (fast file capture)
-- **UART**: Suitable for all ODRs up to 200 Hz without delays
-
-## Capturing Stream to File
-
-**Shell workflow:**
-```bash
-# Terminal 1: Run device shell
-# Issue command: adpd ppg stream-bin 1000
-
-# Terminal 2: Capture to file
-stty -f /dev/ttyUSB0 115200 raw
-(sleep 0.5; cat < /dev/ttyUSB0) | head -c $((1000 * 20)) > stream.bin
-```
-
-**Python with pyserial (automated):**
 ```python
 import serial
-import time
+import struct
 
-port = serial.Serial('/dev/ttyUSB0', 115200, timeout=10)
-num_samples = 1000
+MAGIC = b"\xA5\x5A"
 
-# Send command
-port.write(b'adpd ppg stream-bin 1000\r\n')
-time.sleep(0.1)
+def crc16_ccitt(data: bytes) -> int:
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return crc
 
-# Read start marker (skip text)
-port.readline()
+def read_exact(port, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = port.read(n - len(buf))
+        if not chunk:
+            raise TimeoutError("short read")
+        buf.extend(chunk)
+    return bytes(buf)
 
-# Read N samples × 20 bytes (timestamp + 4 channels)
-data = port.read(num_samples * 20)
+def read_frame(port):
+    while True:
+        if read_exact(port, 1) == MAGIC[:1]:
+            if read_exact(port, 1) == MAGIC[1:]:
+                break
 
-with open('stream.bin', 'wb') as f:
-    f.write(data)
+    header = read_exact(port, 7)
+    version, msg_type, flags, seq_lo, seq_hi, len_lo, len_hi = header
+    payload_len = len_lo | (len_hi << 8)
+    payload = read_exact(port, payload_len)
+    crc_bytes = read_exact(port, 2)
+    crc_rx = crc_bytes[0] | (crc_bytes[1] << 8)
+    crc_calc = crc16_ccitt(bytes([version, msg_type, flags, seq_lo, seq_hi, len_lo, len_hi]) + payload)
+    if crc_rx != crc_calc:
+        raise ValueError("bad CRC")
+    return msg_type, (seq_lo | (seq_hi << 8)), payload
 
-# Read end marker
-port.readline()
-port.close()
+def decode_ppg_payload(payload, num_channels, hr_enabled=False):
+    offset = 0
+    ts_ms = struct.unpack_from("<I", payload, offset)[0]
+    offset += 4
+    channels = []
+    for _ in range(num_channels):
+        channels.append(struct.unpack_from("<I", payload, offset)[0])
+        offset += 4
+    hr = None
+    peak = None
+    if hr_enabled:
+        hr = struct.unpack_from("<f", payload, offset)[0]
+        offset += 4
+        peak = struct.unpack_from("<I", payload, offset)[0]
+    return ts_ms, channels, hr, peak
 ```
 
-## Notes
+## 8. Recommended Capture Flow
 
-- Data immediately follows the start marker message
-- No gaps between samples (continuous stream)
-- Payload length depends on configuration:
-  - **Slot A (4 ch)**: 20 bytes/sample
-  - **Slot AB (8 ch)**: 36 bytes/sample
-  - **HR Enabled**: Adds 8 bytes (Peak + BPM) to any slot mode
-- Timestamp is relative to stream start (first sample = 0 ms)
-- Handle text markers (start/end messages) before parsing binary data
-- Recommended: Discard first 1-2 samples if timing is critical (FIFO warm-up)
-- For sustained logging, pipe directly to file or Python script (avoid terminal buffering)
-- Timestamp allows time-series analysis and synchronization with external events
+1. Open the control port in a text terminal.
+2. Open the stream port in a parser or capture script.
+3. Configure the run on the control port:
+
+```text
+adpd probe sdk
+adpd ppg freq 100
+adpd ppg slota stream-bin 1000
+```
+
+4. Read frames from the stream port until you receive the expected number of samples.
+
+## 9. What Is Not on the Stream Port
+
+The stream port should not be treated like a human terminal.
+
+Do not expect:
+
+- `help`
+- prompts
+- usage text
+- command acknowledgements as shell text
+
+Those belong on the control port.
+
+## 10. Current Limits
+
+This document reflects the current branch behavior:
+
+- stream frames are binary and CRC-protected
+- control remains text-based
+- no binary control TLV protocol is used anymore
