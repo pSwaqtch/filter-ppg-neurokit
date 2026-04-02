@@ -1,23 +1,32 @@
 # Binary Streaming
 
-This document describes the current framed telemetry protocol used on the `ADPD7000 Stream Port`.
+This document describes the current framed telemetry protocol used on the USB CDC stream interface.
 
-The binary stream is emitted on the dedicated CDC data interface only.
+The binary stream is emitted on the dedicated USB CDC interface only.
 
-## 1. Port Model
+## 1. Transport Model
 
-The firmware uses two CDC ports:
+The firmware uses:
 
-- `ADPD7000 Control Port`
+- `USART2`
   Text shell, command input, help, diagnostics
-- `ADPD7000 Stream Port`
+- `USB CDC`
   Framed binary telemetry
 
-You start streaming from the control port, but you read sample frames from the stream port.
+Control is text CLI only. USB is binary framed telemetry only. There is no binary control protocol.
 
-## 2. Start a Stream
+## 2. Frame Types
 
-Issue the command on the control port:
+The USB stream carries two frame types:
+
+- `0xA1` -> heartbeat
+- `0xA0` -> PPG sample
+
+Heartbeats continue while the stream CDC interface remains open on the host.
+
+## 3. Start a Stream
+
+Issue the command on `USART2`:
 
 ```text
 adpd ppg slota stream-bin 1000
@@ -30,9 +39,9 @@ adpd ppg slotab stream-bin 200
 adpd ppg slota2 stream-bin 500
 ```
 
-The firmware then emits framed telemetry on the stream port.
+The firmware then emits framed telemetry on USB CDC. Sample frames appear after streaming is started from `USART2`.
 
-## 3. Frame Envelope
+## 4. Frame Envelope
 
 Binary frames use the shared USB protocol envelope defined in `usb_proto`.
 
@@ -59,6 +68,7 @@ Constants:
 - `magic0 = 0xA5`
 - `magic1 = 0x5A`
 - `version = 0x01`
+- `type = 0xA1` for `USB_PROTO_MSG_STREAM_HEARTBEAT`
 - `type = 0xA0` for `USB_PROTO_MSG_STREAM_PPG`
 
 CRC:
@@ -67,7 +77,7 @@ CRC:
 - computed over `[version .. payload]`
 - excludes the two sync bytes
 
-## 4. PPG Payload
+## 5. PPG Payload
 
 Current PPG payload body:
 
@@ -91,7 +101,7 @@ Payload sizes:
 - Slot AB, HR enabled: `44` bytes
 - Slot A2 depends on configured channel count and HR mode
 
-## 5. Example Frame
+## 6. Example Frame
 
 Example payload for Slot A without HR:
 
@@ -119,7 +129,7 @@ A5 5A 01 A0 00 <seq_lo> <seq_hi> 14 00 <payload 20 bytes> <crc_lo> <crc_hi>
 
 `0x0014` is the payload length for the 20-byte Slot A case.
 
-## 6. Parsing Notes
+## 7. Parsing Notes
 
 Host parser requirements:
 
@@ -131,9 +141,9 @@ Host parser requirements:
 - verify CRC-16/CCITT
 - decode payload according to current stream mode
 
-Do not assume line breaks or text markers on the stream port.
+Do not assume line breaks or text markers on USB CDC.
 
-## 7. Python Skeleton
+## 8. Python Skeleton
 
 ```python
 import serial
@@ -195,11 +205,14 @@ def decode_ppg_payload(payload, num_channels, hr_enabled=False):
     return ts_ms, channels, hr, peak
 ```
 
-## 8. Recommended Capture Flow
+## 9. Recommended Capture Flow
 
-1. Open the control port in a text terminal.
-2. Open the stream port in a parser or capture script.
-3. Configure the run on the control port:
+1. Open `USART2`.
+2. Open USB CDC from your capture tool.
+3. Start `adpd ppg <profile> stream-bin ...` from `USART2`.
+4. Confirm `0xA0` sample frames interleave with `0xA1` heartbeat frames.
+
+Example UART setup:
 
 ```text
 adpd probe sdk
@@ -207,11 +220,9 @@ adpd ppg freq 100
 adpd ppg slota stream-bin 1000
 ```
 
-4. Read frames from the stream port until you receive the expected number of samples.
+## 10. What Is Not on USB CDC
 
-## 9. What Is Not on the Stream Port
-
-The stream port should not be treated like a human terminal.
+USB CDC should not be treated like a human terminal.
 
 Do not expect:
 
@@ -220,12 +231,12 @@ Do not expect:
 - usage text
 - command acknowledgements as shell text
 
-Those belong on the control port.
+Those belong on `USART2`.
 
-## 10. Current Limits
+## 11. Current Limits
 
 This document reflects the current branch behavior:
 
 - stream frames are binary and CRC-protected
-- control remains text-based
+- control remains UART text-based
 - no binary control TLV protocol is used anymore

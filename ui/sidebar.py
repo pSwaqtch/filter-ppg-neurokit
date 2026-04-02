@@ -262,13 +262,13 @@ def _render_live_status_panel() -> None:
     if status["phase"] == "needs_connection":
         pair = find_adpd7000_port_pair()
         st.info(status["detail"])
-        st.caption(f"Suggested control port: {pair['control_port'] or 'Not detected'}")
-        st.caption(f"Suggested stream port: {pair['stream_port'] or 'Not detected'}")
+        st.caption(f"Suggested control shell port: {pair['control_port'] or 'Not detected'}")
+        st.caption(f"Suggested binary stream port: {pair['stream_port'] or 'Not detected'}")
         return
 
     control_port = status["control_port"]
     stream_port = status["stream_port"]
-    st.caption(f"{status['title']}  |  Control `{control_port}`  |  Stream `{stream_port}`")
+    st.caption(f"{status['title']}  |  Control shell `{control_port}`  |  Binary stream `{stream_port}`")
 
     tone = status["tone"]
     if tone == "error":

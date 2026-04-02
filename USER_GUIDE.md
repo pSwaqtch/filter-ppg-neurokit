@@ -1,30 +1,30 @@
 # User Guide
 
-This guide describes how to use the current firmware as it exists on the dual-CDC branch.
+This guide describes how to use the current firmware with UART control and USB binary streaming.
 
-The firmware exposes two USB serial ports:
+The firmware exposes:
 
-- `ADPD7000 Control Port`
+- `USART2`
   Plain-text shell for commands and diagnostics
-- `ADPD7000 Stream Port`
+- `USB CDC`
   Framed binary telemetry output
-
-Do not expect text commands like `help` to work on the stream port.
 
 ## 1. Connect
 
-Open the control port in a serial terminal:
+Open `USART2` in a serial terminal:
 
 ```bash
-screen /dev/tty.usbmodemXXXX 115200
+screen /dev/tty.usbserialXXXX 115200
 ```
+
+Use your USB-to-UART adapter's device path here. `USART2` is the text shell; USB CDC is reserved for binary streaming.
 
 Typical startup banner:
 
 ```text
 --- ADPD7000 Control Shell ---
-Text commands: this port
-Binary samples: ADPD7000 Stream port
+Text commands: USART2
+Binary samples: USB CDC stream
 Type 'help' for the command tree.
 >
 ```
@@ -134,7 +134,7 @@ Supported ODR values:
 - `200`
 - `400`
 
-Set ODR from the control shell:
+Set ODR from the UART shell:
 
 ```text
 adpd ppg freq 100
@@ -155,7 +155,7 @@ adpd ppg stop
 
 ## 7. CSV Streaming
 
-CSV streaming prints on the control port.
+CSV streaming prints on `USART2`.
 
 Examples:
 
@@ -177,7 +177,7 @@ If HR is enabled without a selected channel, the shell rejects the command.
 
 ## 8. Binary Streaming
 
-Binary streaming uses the stream port only:
+Binary streaming uses the USB CDC stream only:
 
 ```text
 adpd ppg slota stream-bin 1000
@@ -186,12 +186,12 @@ adpd ppg slotab stream-bin 200
 
 Important behavior:
 
-- The command is entered on the control port
-- Framed binary output appears on the stream port
-- Human-readable shell output stays on the control port
-- No shell text is intentionally mixed into the stream port
+- The command is entered on `USART2`
+- Framed binary output appears on USB CDC
+- Human-readable shell output stays on `USART2`
+- No shell text is intentionally mixed into USB CDC
 
-Open the stream port with a binary-capable capture tool or a script, not a normal text terminal if you want to parse the payload.
+Open USB CDC with a binary-capable capture tool or a script, not a normal text terminal if you want to parse the payload.
 
 See [BINARY_STREAMING.md](/Volumes/Power/projects/aulee/firmware/FreeRTOS_stm32f4/Reference_Projects/blackpill_eval_adpd7000_sdk_integration/BINARY_STREAMING.md) for the frame format.
 
@@ -208,24 +208,17 @@ adpd ppg freq 100
 adpd ppg slota stream-bin 1000
 ```
 
-Then capture from the stream port with your host-side script.
+Then capture from USB CDC with your host-side script.
 
 ## 10. Troubleshooting
 
-### I see two USB ports. Which one is which?
+### `help` does nothing on USB
 
-Use the interface strings:
-
-- control: `ADPD7000 Control Port`
-- stream: `ADPD7000 Stream Port`
-
-### `help` does nothing on one port
-
-That is expected on the stream port. `help` belongs on the control port only.
+That is expected. `help` belongs on `USART2` only.
 
 ### I can type, but streaming parser fails
 
-Make sure you are reading from the stream port, not the control port.
+Make sure you are reading from USB CDC, not the UART shell.
 
 ### PPG start fails
 

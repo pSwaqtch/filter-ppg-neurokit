@@ -62,7 +62,7 @@ class CaptureModeTests(unittest.TestCase):
             "adpd ppg slota stream 100",
         )
 
-    def test_stream_text_live_dual_port_sends_text_command_and_yields_lines(self) -> None:
+    def test_stream_text_live_dual_port_uses_control_shell_for_text_stream(self) -> None:
         ctrl = FakeSerial()
         stream = FakeSerial()
         lines = ["0,1,2,3,4", "1,5,6,7,8", ""]
@@ -91,6 +91,8 @@ class CaptureModeTests(unittest.TestCase):
         self.assertEqual(chunks[0], ([], b"", [">> [/dev/control] adpd ppg slota stream 2"], False))
         self.assertEqual(chunks[1], (["0,1,2,3,4"], b"0,1,2,3,4\n", [], False))
         self.assertEqual(chunks[2], (["1,5,6,7,8"], b"1,5,6,7,8\n", [], True))
+        self.assertTrue(ctrl.closed)
+        self.assertFalse(stream.closed)
 
     def test_build_ppg_stream_command_supports_text_hr_mode(self) -> None:
         self.assertEqual(

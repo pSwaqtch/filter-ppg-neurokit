@@ -732,7 +732,7 @@ def stream_text_live_dual_port(
     slot: str = "slota",
     hr_channel: str | None = None,
 ):
-    """Generator: start text streaming on the control port and read text lines from the stream port."""
+    """Generator: start text streaming on the control port and read text lines from the control shell."""
     if not SERIAL_AVAILABLE:
         yield [], b"", ["ERROR: pyserial not installed"], True
         return
@@ -749,9 +749,7 @@ def stream_text_live_dual_port(
 
     try:
         ctrl = _open(control_port, baud, timeout=2.0)
-        stream = _open(stream_port, baud, timeout=stream_timeout_s)
         ctrl.reset_input_buffer()
-        stream.reset_input_buffer()
 
         ctrl.write((cmd_str + "\r\n").encode())
         ctrl.flush()
@@ -760,7 +758,7 @@ def stream_text_live_dual_port(
         deadline = time.monotonic() + stream_timeout_s
         received = 0
         while received < num_samples and time.monotonic() < deadline:
-            line = _read_line(stream, timeout_s=0.5)
+            line = _read_line(ctrl, timeout_s=0.5)
             if not line:
                 continue
             received += 1
@@ -768,7 +766,6 @@ def stream_text_live_dual_port(
             yield [line], raw, [], received >= num_samples
 
         ctrl.close()
-        stream.close()
 
         if received < num_samples:
             yield [], b"", [f"Timeout: got {received}/{num_samples} lines"], True

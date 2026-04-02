@@ -146,7 +146,7 @@ def render_serial_tab():
     st.markdown(_SERIAL_CSS, unsafe_allow_html=True)
     st.header("Connect Device")
     st.caption(
-        "Pair the ADPD7000 control and stream ports here, run the live feed, then use expert shell and raw capture tools when needed."
+        "Pair the control shell port and binary stream port here, run the live feed, then use expert shell and capture tools when needed."
     )
 
     if not SERIAL_AVAILABLE:
@@ -192,11 +192,11 @@ def _render_connection_panel():
             default_control = detected_pair["control_port"] or active_control or ports[0]
             idx = ports.index(default_control) if default_control in ports else 0
             control_port = st.selectbox(
-                "Control Port", ports, index=idx, key="tab_conn_control", disabled=is_connected
+                "Control Shell Port", ports, index=idx, key="tab_conn_control", disabled=is_connected
             )
         else:
             control_port = st.text_input(
-                "Control Port (manual)",
+                "Control Shell Port (manual)",
                 value=active_control or detected_pair["control_port"] or "/dev/tty.usbmodem101",
                 key="tab_conn_control_txt",
                 disabled=is_connected,
@@ -208,11 +208,11 @@ def _render_connection_panel():
             default_stream = detected_pair["stream_port"] or active_stream or fallback_stream
             idx = ports.index(default_stream) if default_stream in ports else min(1, len(ports) - 1)
             stream_port = st.selectbox(
-                "Stream Port", ports, index=idx, key="tab_conn_stream", disabled=is_connected
+                "Binary Stream Port", ports, index=idx, key="tab_conn_stream", disabled=is_connected
             )
         else:
             stream_port = st.text_input(
-                "Stream Port (manual)",
+                "Binary Stream Port (manual)",
                 value=active_stream or detected_pair["stream_port"] or "/dev/tty.usbmodem102",
                 key="tab_conn_stream_txt",
                 disabled=is_connected,
@@ -228,9 +228,9 @@ def _render_connection_panel():
         if not is_connected:
             if st.button("Connect", type="primary", width="stretch", key="tab_conn_btn"):
                 if not control_port or not stream_port:
-                    st.session_state["_tab_conn_err"] = "Select both a control port and a stream port."
+                    st.session_state["_tab_conn_err"] = "Select both a control shell port and a binary stream port."
                 elif control_port == stream_port:
-                    st.session_state["_tab_conn_err"] = "Control port and stream port must be different."
+                    st.session_state["_tab_conn_err"] = "Control shell port and binary stream port must be different."
                 else:
                     with st.spinner(f"Connecting to {control_port} / {stream_port}…"):
                         chk_control = test_connection(control_port, baud)
@@ -270,8 +270,8 @@ def _render_connection_panel():
     if is_connected:
         desc_map = {p["device"]: p["description"] for p in describe_ports()}
         st.success(
-            f"Connected — control **{active_control}** ({desc_map.get(active_control, active_control)})"
-            f" · stream **{active_stream}** ({desc_map.get(active_stream, active_stream)})"
+           f"Connected — control **{active_control}** ({desc_map.get(active_control, active_control)})"
+            f" · binary stream **{active_stream}** ({desc_map.get(active_stream, active_stream)})"
             f" · {active_baud} baud"
         )
     else:
@@ -318,9 +318,9 @@ def _render_connection_panel():
             if ports:
                 desc_map = {p["device"]: p["description"] for p in describe_ports()}
                 if control_port in desc_map:
-                    st.caption(f"Control device: {desc_map[control_port]}")
+                    st.caption(f"Control shell device: {desc_map[control_port]}")
                 if stream_port in desc_map:
-                    st.caption(f"Stream device: {desc_map[stream_port]}")
+                    st.caption(f"Binary stream device: {desc_map[stream_port]}")
             st.warning("Not connected — select a port and click Connect.")
 
     # ── Connection log (collapsed by default) ─────────────────────────────────
@@ -384,7 +384,7 @@ def _render_live_analysis_feed():
 
     st.subheader("2. Feed Live Analysis")
     st.caption(
-        "This is the only place that starts or stops the live feed used by the analysis dashboard."
+        "This is the only place that starts or stops the live binary feed used by the analysis dashboard."
     )
 
     head1, head2, head3, head4 = st.columns(4)
@@ -842,7 +842,7 @@ def _render_stream_capture():
     active_baud = st.session_state.get("conn_baud", 115200)
 
     st.subheader("4. Capture Raw Stream")
-    st.caption(f"Control: `{active_control or '—'}`  |  Stream: `{active_stream or '—'}`")
+    st.caption(f"Control shell: `{active_control or '—'}`  |  Binary stream: `{active_stream or '—'}`")
 
     bs1, bs2, bs3 = st.columns([2, 2, 2])
     with bs1:
@@ -869,11 +869,11 @@ def _render_stream_capture():
 
     if capture_format == "Binary framed":
         st.caption(
-            "Reads framed binary payloads from the stream port and renders parsed channels, HR, and exports."
+            "Runs `stream-bin` from the control shell port and reads framed binary telemetry from the binary stream port."
         )
     else:
         st.caption(
-            "Reads human-readable text lines from the stream port for quick sanity checks and terminal-style inspection."
+            "Runs `stream` on the control shell port and reads human-readable text from that same control shell port."
         )
 
     # Slot and HR selectors — must match what was set via the PPG Control section
