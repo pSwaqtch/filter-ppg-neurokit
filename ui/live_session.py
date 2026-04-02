@@ -439,7 +439,6 @@ def launch_live_stream(
     session = ensure_live_session_state(state)
     stop_event = threading.Event()
     shared = create_live_shared_state()
-    session[LIVE_SLOT_KEY] = normalize_slot(slot)
     start_live_session(session, shared=shared, stop_event=stop_event)
 
     if stream_factory is None:

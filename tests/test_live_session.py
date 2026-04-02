@@ -9,6 +9,7 @@ from ui.live_session import (
     LIVE_COMPUTED_SR_KEY,
     LIVE_FINALISED_KEY,
     LIVE_SHARED_KEY,
+    LIVE_SLOT_KEY,
     LIVE_STREAMING_KEY,
     LIVE_STOP_EVENT_KEY,
     LiveSample,
@@ -236,6 +237,25 @@ class LiveSessionTests(unittest.TestCase):
         shared = state[LIVE_SHARED_KEY]
         self.assertEqual(shared["error"], "boom")
         self.assertTrue(shared["done"])
+
+    def test_launch_live_stream_does_not_overwrite_widget_owned_slot_state(self) -> None:
+        state: dict[str, object] = {LIVE_SLOT_KEY: "slotab"}
+
+        def fake_stream(*_args, **_kwargs):
+            yield [], b"", [], True
+
+        thread = launch_live_stream(
+            state,
+            control_port="/dev/control",
+            stream_port="/dev/stream",
+            baud=115200,
+            num_samples=1,
+            slot="slota",
+            stream_factory=fake_stream,
+        )
+        thread.join(timeout=2.0)
+
+        self.assertEqual(state[LIVE_SLOT_KEY], "slotab")
 
 
 if __name__ == "__main__":

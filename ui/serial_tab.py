@@ -38,7 +38,7 @@ from ui.live_session import (
 from usb_serial import (
     SERIAL_AVAILABLE, list_serial_ports, describe_ports, find_adpd7000_port_pair,
     find_port_owner, force_release_port, test_connection,
-    send_command, stream_binary_live_dual_port,
+    send_command, stream_binary_live_dual_port, stream_text_live_dual_port,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -164,7 +164,7 @@ def render_serial_tab():
     st.divider()
     _render_command_console()
     st.divider()
-    _render_binary_capture()
+    _render_stream_capture()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -833,32 +833,48 @@ def _render_command_console():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Binary stream capture
+# Stream capture
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _render_binary_capture():
+def _render_stream_capture():
     active_control = st.session_state.get("conn_control_port", st.session_state.get("conn_port", ""))
     active_stream = st.session_state.get("conn_stream_port", "")
     active_baud = st.session_state.get("conn_baud", 115200)
 
     st.subheader("4. Capture Raw Stream")
-    st.caption(
-        "Sends `adpd ppg <slot> stream-bin N [hr on <ch>]` on the control port and reads framed data from the stream port — "
-        "Slot A: 20 bytes/frame · Slot AB: 36 bytes/frame · +HR: +8 bytes.  "
-        "Ch3/Ch4 = PPG · Ch1/Ch2 = ambient."
-    )
     st.caption(f"Control: `{active_control or '—'}`  |  Stream: `{active_stream or '—'}`")
 
-    bs1, bs2, bs3 = st.columns([2, 2, 1])
+    bs1, bs2, bs3 = st.columns([2, 2, 2])
     with bs1:
+        capture_format = st.radio(
+            "Format",
+            ["Binary framed", "Human-readable text"],
+            horizontal=True,
+            key="capture_format",
+        )
+    with bs2:
         n_samples = st.number_input("Samples", min_value=10, max_value=100_000,
                                     value=500, step=50, key="capture_n_samples")
-    with bs2:
+    with bs3:
         stream_timeout = st.number_input("Timeout (s)", min_value=5.0, max_value=120.0,
                                          value=30.0, step=5.0, key="capture_timeout")
-    with bs3:
-        live_mode = st.toggle("Live graph", value=True, key="capture_live_mode",
-                              help="Update chart while data arrives")
+    live_mode = False
+    if capture_format == "Binary framed":
+        live_mode = st.toggle(
+            "Live chart",
+            value=True,
+            key="capture_live_mode",
+            help="Update the parsed channel chart while binary frames arrive.",
+        )
+
+    if capture_format == "Binary framed":
+        st.caption(
+            "Reads framed binary payloads from the stream port and renders parsed channels, HR, and exports."
+        )
+    else:
+        st.caption(
+            "Reads human-readable text lines from the stream port for quick sanity checks and terminal-style inspection."
+        )
 
     # Slot and HR selectors — must match what was set via the PPG Control section
     bs4, bs5 = st.columns([2, 3])
@@ -879,9 +895,10 @@ def _render_binary_capture():
     hr_channel = None if cap_hr_ch == "— no HR" else cap_hr_ch
 
     is_capturing = st.session_state.get("capture_streaming", False)
+    capture_action_label = "Capture Binary Stream" if capture_format == "Binary framed" else "Capture Text Stream"
     btn1, btn2 = st.columns([3, 1])
     with btn1:
-        capture_btn = st.button("Capture Stream", type="primary", width="stretch",
+        capture_btn = st.button(capture_action_label, type="primary", width="stretch",
                                 key="capture_btn", disabled=is_capturing)
     with btn2:
         stop_btn = st.button("Stop", type="secondary", width="stretch",
@@ -896,7 +913,8 @@ def _render_binary_capture():
 
     if capture_btn and not is_capturing:
         _start_capture(active_control, active_stream, active_baud, int(n_samples),
-                       float(stream_timeout), live_mode, cap_slot, hr_channel)
+                       float(stream_timeout), live_mode, cap_slot, hr_channel,
+                       binary=(capture_format == "Binary framed"))
         st.rerun()
 
     # run_every=0.5 s while streaming for live updates; None when idle (no polling)
@@ -906,7 +924,9 @@ def _render_binary_capture():
     def _capture_fragment():
         shared    = st.session_state.get("_sshared_capture", {})
         capturing = st.session_state.get("capture_streaming", False)
+        capture_mode = shared.get("format", st.session_state.get("capture_format", "Binary framed"))
         buf       = shared.get("buf", [])
+        text_lines = shared.get("text_lines", [])
         raw_buf   = shared.get("raw", bytearray())
         log_buf   = shared.get("log", [])
         error     = shared.get("error")
@@ -917,27 +937,42 @@ def _render_binary_capture():
             st.session_state["capture_streaming"] = False
             capturing = False
 
-        if capturing or (done and buf):
+        live_window_s = None
+        if capture_mode == "Binary framed" and capturing and st.session_state.get("capture_live_mode"):
+            live_window_s = st.radio(
+                "Display window",
+                [5, 10],
+                horizontal=True,
+                format_func=lambda value: f"{value} s",
+                key="capture_window_s",
+            )
+
+        item_count = len(buf) if capture_mode == "Binary framed" else len(text_lines)
+        item_unit = "samples" if capture_mode == "Binary framed" else "lines"
+
+        if capturing or (done and item_count):
             requested = st.session_state.get("capture_n_samples", 1)
-            pct = min(int(len(buf) / max(requested, 1) * 100), 100)
+            pct = min(int(item_count / max(requested, 1) * 100), 100)
             stopped = error or st.session_state.get(
                 "capture_stop_event", threading.Event()
             ).is_set()
-            label = (f"Receiving… {len(buf)}/{requested}"
+            label = (f"Receiving… {item_count}/{requested} {item_unit}"
                      if capturing else
-                     f"{'Stopped' if stopped else 'Complete'} — {len(buf)} samples")
+                     f"{'Stopped' if stopped else 'Complete'} — {item_count} {item_unit}")
             st.progress(pct, text=label)
 
         if error:
             st.error(f"Stream error: {error}")
 
-        if buf and (capturing or done):
-            _render_capture_chart(buf, key="live")
+        if capture_mode == "Binary framed" and buf and (capturing or done):
+            _render_capture_chart(buf, key="live", window_s=live_window_s if capturing else None)
             _render_capture_metrics(buf, raw_buf, key_sfx="")
+        elif capture_mode == "Human-readable text" and text_lines:
+            _render_text_capture(text_lines, raw_buf, key="live_text")
 
         # Finalise exactly once — copy shared buffer to stable session state keys
-        if done and buf and not capturing and not st.session_state.get("_capture_finalised"):
-            _finalise_capture(buf, raw_buf, log_buf, error)
+        if done and (buf or text_lines) and not capturing and not st.session_state.get("_capture_finalised"):
+            _finalise_capture(buf, text_lines, raw_buf, log_buf, error, capture_mode)
             st.rerun()
 
         if log_buf:
@@ -950,38 +985,50 @@ def _render_binary_capture():
     # Shown when no capture is in progress and the shared buffer has been cleared.
     # This lets the researcher examine data after the live fragment stops updating.
     samples   = st.session_state.get("_capture_last_samples", [])
+    text_lines = st.session_state.get("_capture_last_text_lines", [])
     raw_bytes = st.session_state.get("_capture_last_raw", b"")
     log       = st.session_state.get("_capture_last_log", [])
+    capture_mode = st.session_state.get("_capture_last_format", st.session_state.get("capture_format", "Binary framed"))
     show_static = (
-        samples and not is_capturing
+        (samples or text_lines) and not is_capturing
         and not st.session_state.get("_sshared_capture", {}).get("done")
     )
     if show_static:
-        _render_capture_chart(samples, key="static")
-        _render_capture_metrics(samples, raw_bytes, key_sfx="_s")
+        if capture_mode == "Binary framed" and samples:
+            _render_capture_chart(samples, key="static")
+            _render_capture_metrics(samples, raw_bytes, key_sfx="_s")
+        elif capture_mode == "Human-readable text" and text_lines:
+            _render_text_capture(text_lines, raw_bytes, key="static_text")
         if log:
             with st.expander("Stream log"):
                 st.code("\n".join(log), language="text")
         if st.button("Clear Captured Data", key="capture_clear"):
-            for k in ("_capture_last_samples", "_capture_last_raw", "_capture_last_log",
+            for k in ("_capture_last_samples", "_capture_last_text_lines", "_capture_last_raw", "_capture_last_log", "_capture_last_format",
                       "_sshared_capture", "_capture_finalised"):
                 st.session_state.pop(k, None)
             st.rerun()
 
 
 def _start_capture(control_port, stream_port, baud, n_samples, timeout_s, live_mode,
-                   slot: str = "slota", hr_channel: str | None = None):
+                   slot: str = "slota", hr_channel: str | None = None, binary: bool = True):
     """Kick off the binary stream worker in a daemon thread.
 
     A shared dict is used for thread-safe communication: the worker appends
     to buf/raw/log and sets done=True on exit.  The Streamlit fragment polls
     this dict every 0.5 s via run_every.
 
-    slot and hr_channel are forwarded to stream_binary_live_dual_port so the correct
-    command is sent (e.g. ``adpd ppg slotab stream-bin 500 hr on sBch3``).
+    slot/hr/mode are forwarded to the serial helper so the correct stream command is sent.
     """
     stop_ev = threading.Event()
-    shared: dict = {"buf": [], "raw": bytearray(), "log": [], "error": None, "done": False}
+    shared: dict = {
+        "buf": [],
+        "text_lines": [],
+        "raw": bytearray(),
+        "log": [],
+        "error": None,
+        "done": False,
+        "format": "Binary framed" if binary else "Human-readable text",
+    }
     st.session_state["capture_streaming"]  = True
     st.session_state["capture_stop_event"] = stop_ev
     st.session_state["_sshared_capture"]   = shared
@@ -989,13 +1036,24 @@ def _start_capture(control_port, stream_port, baud, n_samples, timeout_s, live_m
 
     def _worker():
         try:
-            for new_s, new_raw, new_log, _ in stream_binary_live_dual_port(
-                control_port, stream_port, baud, n_samples, stream_timeout_s=timeout_s,
-                slot=slot, hr_channel=hr_channel,
-            ):
+            stream_iter = (
+                stream_binary_live_dual_port(
+                    control_port, stream_port, baud, n_samples, stream_timeout_s=timeout_s,
+                    slot=slot, hr_channel=hr_channel,
+                )
+                if binary else
+                stream_text_live_dual_port(
+                    control_port, stream_port, baud, n_samples, stream_timeout_s=timeout_s,
+                    slot=slot, hr_channel=hr_channel,
+                )
+            )
+            for new_s, new_raw, new_log, _ in stream_iter:
                 if stop_ev.is_set():
                     break
-                shared["buf"].extend(new_s)
+                if binary:
+                    shared["buf"].extend(new_s)
+                else:
+                    shared["text_lines"].extend(new_s)
                 shared["raw"].extend(new_raw)
                 shared["log"].extend(new_log)
                 # Surface stream-level errors (e.g. frame sync lost) immediately
@@ -1012,13 +1070,22 @@ def _start_capture(control_port, stream_port, baud, n_samples, timeout_s, live_m
 
     threading.Thread(target=_worker, daemon=True).start()
     _log(
-        f"Capture start: {n_samples} samples via control {control_port} / stream {stream_port} "
+        f"Capture start: {n_samples} {'binary samples' if binary else 'text lines'} via control {control_port} / stream {stream_port} "
         f"({'live' if live_mode else 'batch'})",
         "info",
     )
 
 
-def _render_capture_chart(buf: list, key: str):
+def _select_capture_window(buf: list, window_s: int | None) -> list:
+    """Return only the most recent N seconds of capture samples."""
+    if not buf or not window_s:
+        return buf
+    latest_ts = buf[-1][0]
+    min_ts = latest_ts - window_s * 1000
+    return [sample for sample in buf if sample[0] >= min_ts]
+
+
+def _render_capture_chart(buf: list, key: str, window_s: int | None = None):
     """Plot ADC channels (and optionally HR) against elapsed time.
 
     Adapts to variable sample tuple length:
@@ -1029,8 +1096,9 @@ def _render_capture_chart(buf: list, key: str):
 
     uirevision="capture" keeps zoom/pan state stable across fragment reruns.
     """
-    ts_ms   = [s[0] for s in buf]
-    n_tuple = len(buf[0])
+    view_buf = _select_capture_window(buf, window_s)
+    ts_ms   = [s[0] for s in view_buf]
+    n_tuple = len(view_buf[0])
     # Determine mode from tuple length
     n_ch    = {5: 4, 7: 4, 9: 8, 11: 8}.get(n_tuple, 4)
     has_hr  = n_tuple in (7, 11)
@@ -1041,7 +1109,7 @@ def _render_capture_chart(buf: list, key: str):
     for i in range(n_ch):
         label, color, visible = _CH_INFO[i]
         fig.add_trace(go.Scatter(
-            x=ts_ms, y=[s[i + 1] for s in buf],
+            x=ts_ms, y=[s[i + 1] for s in view_buf],
             mode="lines", name=label,
             line=dict(color=color, width=1),
             visible=visible,
@@ -1050,10 +1118,10 @@ def _render_capture_chart(buf: list, key: str):
     if has_hr:
         hr_idx   = n_ch + 1   # float32 HR BPM field
         peak_idx = n_ch + 2   # uint32 peak flag
-        hr_vals  = [s[hr_idx] for s in buf]
+        hr_vals  = [s[hr_idx] for s in view_buf]
         # Peak timestamps — only points where peak == 1
-        peak_ts  = [ts_ms[i] for i, s in enumerate(buf) if s[peak_idx]]
-        peak_hr  = [s[hr_idx] for s in buf if s[peak_idx]]
+        peak_ts  = [ts_ms[i] for i, s in enumerate(view_buf) if s[peak_idx]]
+        peak_hr  = [s[hr_idx] for s in view_buf if s[peak_idx]]
 
         # HR on a secondary y-axis so it doesn't compress the ADC scale
         fig.add_trace(go.Scatter(
@@ -1080,8 +1148,12 @@ def _render_capture_chart(buf: list, key: str):
         margin=dict(l=0, r=0, t=30, b=0),
         height=360,
         legend=dict(orientation="h", y=1.07),
-        uirevision="capture",  # preserves zoom state between fragment reruns
+        yaxis=dict(autorange=True),
     )
+    if window_s and len(ts_ms) > 1:
+        fig.update_xaxes(range=[ts_ms[0], ts_ms[-1]])
+    else:
+        fig.update_layout(uirevision="capture")
     st.plotly_chart(fig, use_container_width=True, key=f"chart_capture_{key}")
     slot_label = "Slot AB (8-ch)" if n_ch == 8 else "Slot A (4-ch)"
     hr_label   = " · HR + Peak on right axis" if has_hr else ""
@@ -1137,19 +1209,59 @@ def _render_capture_metrics(buf: list, raw_bytes, key_sfx: str):
                            help=f"{len(rb):,} bytes raw payload")
 
 
-def _finalise_capture(buf, raw_buf, log_buf, error):
+def _render_text_capture(lines: list[str], raw_bytes: bytes | bytearray, key: str):
+    """Render captured text lines and text-mode exports."""
+    st.text_area(
+        "Captured text stream",
+        value="\n".join(lines[-200:]),
+        height=320,
+        key=f"text_capture_{key}",
+    )
+    cols = st.columns(3)
+    cols[0].metric("Lines", len(lines))
+    cols[1].metric("Bytes", len(raw_bytes))
+    cols[2].metric("Preview", min(len(lines), 200))
+
+    dl1, dl2 = st.columns(2)
+    with dl1:
+        st.download_button(
+            "Export Text (.txt)",
+            "\n".join(lines).encode(),
+            "capture.txt",
+            "text/plain",
+            key=f"dl_cap_txt_{key}",
+            width="stretch",
+        )
+    with dl2:
+        st.download_button(
+            "Export Raw Bytes (.bin)",
+            bytes(raw_bytes),
+            "capture_text_raw.bin",
+            "application/octet-stream",
+            key=f"dl_cap_text_raw_{key}",
+            width="stretch",
+        )
+
+
+def _finalise_capture(buf, text_lines, raw_buf, log_buf, error, capture_mode: str):
     """Copy the shared mutable buffers into stable session state keys.
 
     Called exactly once per capture run (guarded by _capture_finalised flag).
     After this, the shared dict can be cleared without losing captured data.
     """
     st.session_state["_capture_last_samples"] = list(buf)
+    st.session_state["_capture_last_text_lines"] = list(text_lines)
     st.session_state["_capture_last_raw"]     = bytes(raw_buf)
     st.session_state["_capture_last_log"]     = list(log_buf)
+    st.session_state["_capture_last_format"]  = capture_mode
     if error:
         _log(f"Capture ended with error: {error}", "error")
     elif st.session_state.get("capture_stop_event", threading.Event()).is_set():
-        _log(f"Capture stopped: {len(buf)} samples kept", "warn")
+        kept = len(text_lines) if capture_mode == "Human-readable text" else len(buf)
+        unit = "lines" if capture_mode == "Human-readable text" else "samples"
+        _log(f"Capture stopped: {kept} {unit} kept", "warn")
     else:
-        _log(f"Capture complete: {len(buf)} samples", "ok")
+        kept = len(text_lines) if capture_mode == "Human-readable text" else len(buf)
+        unit = "lines" if capture_mode == "Human-readable text" else "samples"
+        _log(f"Capture complete: {kept} {unit}", "ok")
     st.session_state["_capture_finalised"] = True

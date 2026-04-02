@@ -308,6 +308,19 @@ def send_command(
         return CommandResult(command=command, error=f"Unexpected error: {exc}")
 
 
+def build_ppg_stream_command(
+    slot: str,
+    num_samples: int,
+    *,
+    hr_channel: str | None = None,
+    binary: bool = True,
+) -> str:
+    """Build the firmware PPG stream command for text or binary capture."""
+    verb = "stream-bin" if binary else "stream"
+    hr_suffix = f" hr on {hr_channel}" if hr_channel else ""
+    return f"adpd ppg {slot} {verb} {num_samples}{hr_suffix}"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Binary frame protocol constants  (must match the documented USB envelope)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -508,8 +521,7 @@ def receive_binary_stream(
 
     result = StreamResult()
     # Build command string — slot prefix is required; hr suffix is optional
-    hr_suffix = f" hr on {hr_channel}" if hr_channel else ""
-    cmd_str = f"adpd ppg {slot} stream-bin {num_samples}{hr_suffix}"
+    cmd_str = build_ppg_stream_command(slot, num_samples, hr_channel=hr_channel, binary=True)
 
     try:
         ser = _open(port, baud, timeout=stream_timeout_s)
@@ -592,8 +604,7 @@ def stream_binary_live(
 
     log: list[str] = []
     # Build the command — slot prefix required, HR suffix optional
-    hr_suffix = f" hr on {hr_channel}" if hr_channel else ""
-    cmd_str = f"adpd ppg {slot} stream-bin {num_samples}{hr_suffix}"
+    cmd_str = build_ppg_stream_command(slot, num_samples, hr_channel=hr_channel, binary=True)
 
     try:
         ser = _open(port, baud, timeout=stream_timeout_s)
@@ -665,8 +676,7 @@ def stream_binary_live_dual_port(
         return
 
     log: list[str] = []
-    hr_suffix = f" hr on {hr_channel}" if hr_channel else ""
-    cmd_str = f"adpd ppg {slot} stream-bin {num_samples}{hr_suffix}"
+    cmd_str = build_ppg_stream_command(slot, num_samples, hr_channel=hr_channel, binary=True)
 
     try:
         ctrl = _open(control_port, baud, timeout=2.0)
@@ -706,6 +716,62 @@ def stream_binary_live_dual_port(
 
         if log:
             yield [], b"", log, True
+
+    except serial.SerialException as exc:
+        yield [], b"", [f"ERROR: {exc}"], True
+    except Exception as exc:
+        yield [], b"", [f"ERROR: Unexpected: {exc}"], True
+
+
+def stream_text_live_dual_port(
+    control_port: str,
+    stream_port: str,
+    baud: int,
+    num_samples: int,
+    stream_timeout_s: float = 30.0,
+    slot: str = "slota",
+    hr_channel: str | None = None,
+):
+    """Generator: start text streaming on the control port and read text lines from the stream port."""
+    if not SERIAL_AVAILABLE:
+        yield [], b"", ["ERROR: pyserial not installed"], True
+        return
+
+    if not control_port or not stream_port:
+        yield [], b"", ["ERROR: Both control and stream ports are required"], True
+        return
+
+    if control_port == stream_port:
+        yield [], b"", ["ERROR: Control port and stream port must be different"], True
+        return
+
+    cmd_str = build_ppg_stream_command(slot, num_samples, hr_channel=hr_channel, binary=False)
+
+    try:
+        ctrl = _open(control_port, baud, timeout=2.0)
+        stream = _open(stream_port, baud, timeout=stream_timeout_s)
+        ctrl.reset_input_buffer()
+        stream.reset_input_buffer()
+
+        ctrl.write((cmd_str + "\r\n").encode())
+        ctrl.flush()
+        yield [], b"", [f">> [{control_port}] {cmd_str}"], False
+
+        deadline = time.monotonic() + stream_timeout_s
+        received = 0
+        while received < num_samples and time.monotonic() < deadline:
+            line = _read_line(stream, timeout_s=0.5)
+            if not line:
+                continue
+            received += 1
+            raw = (line + "\n").encode()
+            yield [line], raw, [], received >= num_samples
+
+        ctrl.close()
+        stream.close()
+
+        if received < num_samples:
+            yield [], b"", [f"Timeout: got {received}/{num_samples} lines"], True
 
     except serial.SerialException as exc:
         yield [], b"", [f"ERROR: {exc}"], True
